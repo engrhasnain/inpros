@@ -1,0 +1,931 @@
+#[pyfunction(signature = (path, limit=None))]
+pub fn decode_dim_linear_entities(path: &str, limit: Option<usize>) -> PyResult<Vec<DimEntityRow>> {
+    decode_dim_entities_by_type(
+        path,
+        limit,
+        0x15,
+        "DIM_LINEAR",
+        true,
+        decode_dim_linear_for_version,
+    )
+}
+
+#[pyfunction(signature = (path, limit=None))]
+pub fn decode_dim_ordinate_entities(
+    path: &str,
+    limit: Option<usize>,
+) -> PyResult<Vec<DimEntityRow>> {
+    decode_dim_entities_by_type(
+        path,
+        limit,
+        0x14,
+        "DIM_ORDINATE",
+        true,
+        decode_dim_ordinate_for_version,
+    )
+}
+
+#[pyfunction(signature = (path, limit=None))]
+pub fn decode_dim_diameter_entities(
+    path: &str,
+    limit: Option<usize>,
+) -> PyResult<Vec<DimEntityRow>> {
+    decode_dim_entities_by_type(
+        path,
+        limit,
+        0x1A,
+        "DIM_DIAMETER",
+        true,
+        decode_dim_diameter_for_version,
+    )
+}
+
+#[pyfunction(signature = (path, limit=None))]
+pub fn decode_dim_aligned_entities(
+    path: &str,
+    limit: Option<usize>,
+) -> PyResult<Vec<DimEntityRow>> {
+    decode_dim_entities_by_type(
+        path,
+        limit,
+        0x16,
+        "DIM_ALIGNED",
+        true,
+        decode_dim_aligned_for_version,
+    )
+}
+
+#[pyfunction(signature = (path, limit=None))]
+pub fn decode_dim_ang3pt_entities(path: &str, limit: Option<usize>) -> PyResult<Vec<DimEntityRow>> {
+    decode_dim_entities_by_type(
+        path,
+        limit,
+        0x17,
+        "DIM_ANG3PT",
+        true,
+        decode_dim_ang3pt_for_version,
+    )
+}
+
+#[pyfunction(signature = (path, limit=None))]
+pub fn decode_dim_ang2ln_entities(path: &str, limit: Option<usize>) -> PyResult<Vec<DimEntityRow>> {
+    decode_dim_entities_by_type(
+        path,
+        limit,
+        0x18,
+        "DIM_ANG2LN",
+        true,
+        decode_dim_ang2ln_for_version,
+    )
+}
+
+#[pyfunction(signature = (path, limit=None))]
+pub fn decode_dim_radius_entities(path: &str, limit: Option<usize>) -> PyResult<Vec<DimEntityRow>> {
+    decode_dim_entities_by_type(
+        path,
+        limit,
+        0x19,
+        "DIM_RADIUS",
+        true,
+        decode_dim_radius_for_version,
+    )
+}
+
+#[pyfunction(signature = (path, limit=None))]
+pub fn decode_dimension_entities(
+    path: &str,
+    limit: Option<usize>,
+) -> PyResult<Vec<DimTypedEntityRow>> {
+    let shared = decoded_file(path)?;
+    let decoder = shared.decoder()?;
+    let best_effort = shared.best_effort;
+    let dynamic_types = &shared.dynamic_types;
+    let index = &shared.index;
+    let insert_name_state =
+        insert_name_resolution_state(path, &decoder, dynamic_types, index, best_effort)?;
+    decode_dimension_entities_with_state(
+        &decoder,
+        dynamic_types,
+        index,
+        best_effort,
+        &insert_name_state,
+        limit,
+    )
+}
+
+fn decode_dimension_entities_with_state(
+    decoder: &decoder::Decoder<'_>,
+    dynamic_types: &HashMap<u16, String>,
+    index: &objects::ObjectIndex,
+    best_effort: bool,
+    insert_name_state: &InsertNameResolutionState,
+    limit: Option<usize>,
+) -> PyResult<Vec<DimTypedEntityRow>> {
+    let mut result: Vec<DimTypedEntityRow> = Vec::new();
+
+    for obj in index.objects.iter() {
+        let Some((record, header)) = parse_record_and_header(decoder, obj.offset, best_effort)?
+        else {
+            continue;
+        };
+
+        if let Some((dimtype, row)) = decode_dimension_typed_row(
+            &record,
+            &header,
+            obj.handle.0,
+            decoder.version(),
+            dynamic_types,
+            best_effort,
+            insert_name_state,
+        )? {
+            result.push((dimtype.to_string(), row));
+            if let Some(limit) = limit {
+                if result.len() >= limit {
+                    break;
+                }
+            }
+        }
+    }
+
+    Ok(result)
+}
+
+fn decode_dimension_typed_row(
+    record: &objects::ObjectRecord<'_>,
+    header: &ApiObjectHeader,
+    object_handle: u64,
+    version: &version::DwgVersion,
+    dynamic_types: &HashMap<u16, String>,
+    best_effort: bool,
+    insert_name_state: &InsertNameResolutionState,
+) -> PyResult<Option<(&'static str, DimEntityRow)>> {
+    for spec in DIM_DECODE_SPECS.iter() {
+        if !matches_type_name(
+            header.type_code,
+            spec.type_code,
+            spec.type_name,
+            dynamic_types,
+        ) {
+            continue;
+        }
+
+        let mut entity = match decode_dim_linear_like_entity_with_prefix_fallback(
+            record,
+            version,
+            header,
+            object_handle,
+            true,
+            spec.decode_entity,
+        ) {
+            Ok(entity) => entity,
+            Err(_err) if best_effort => return Ok(None),
+            Err(err) => return Err(to_py_err(err)),
+        };
+        match decode_dimension_style_and_block_handles(record, version, header) {
+            // A null handle: the dimension has no anonymous block to recover.
+            Some((dimstyle_handle, 0)) => {
+                entity.common.dimstyle_handle = Some(dimstyle_handle);
+                entity.common.anonymous_block_handle = None;
+            }
+            Some((dimstyle_handle, block_handle))
+                if insert_name_state
+                    .known_block_handles
+                    .contains(&block_handle) =>
+            {
+                entity.common.dimstyle_handle = Some(dimstyle_handle);
+                entity.common.anonymous_block_handle = Some(block_handle);
+            }
+            _ => {
+                entity.common.anonymous_block_handle =
+                    recover_dimension_anonymous_block_handle_r2010_plus(
+                        record,
+                        version,
+                        header,
+                        object_handle,
+                        entity.common.anonymous_block_handle,
+                        &insert_name_state.known_block_handles,
+                        &insert_name_state.named_block_handles,
+                        &insert_name_state.block_header_names,
+                    );
+            }
+        }
+        return Ok(Some((
+            spec.dimtype,
+            dim_entity_row_from_linear_like(&entity),
+        )));
+    }
+
+    Ok(None)
+}
+
+/// DIMSTYLE and anonymous BLOCK handles of a dimension record. They follow the
+/// common entity handles in the handle stream (ODA spec 20.4.22), so they can
+/// be read without decoding the dimension data itself.
+fn decode_dimension_style_and_block_handles(
+    record: &objects::ObjectRecord<'_>,
+    version: &version::DwgVersion,
+    header: &ApiObjectHeader,
+) -> Option<(u64, u64)> {
+    let (mut reader, common, _handles) =
+        read_common_entity_header_and_handles(record, version, header)?;
+    let dimstyle = entities::common::read_handle_reference(&mut reader, common.handle).ok()?;
+    let block = entities::common::read_handle_reference(&mut reader, common.handle).ok()?;
+    Some((dimstyle, block))
+}
+
+fn build_ultra_minimal_dim_linear_entity(object_handle: u64) -> entities::DimLinearEntity {
+    let common = entities::DimensionCommonData {
+        handle: object_handle,
+        color_index: None,
+        true_color: None,
+        layer_handle: 0,
+        extrusion: (0.0, 0.0, 1.0),
+        text_midpoint: (0.0, 0.0, 0.0),
+        elevation: 0.0,
+        dim_flags: 0,
+        user_text: String::new(),
+        text_rotation: 0.0,
+        horizontal_direction: 0.0,
+        insert_scale: (1.0, 1.0, 1.0),
+        insert_rotation: 0.0,
+        attachment_point: None,
+        line_spacing_style: None,
+        line_spacing_factor: None,
+        actual_measurement: None,
+        insert_point: None,
+        dimstyle_handle: None,
+        anonymous_block_handle: None,
+    };
+    entities::DimLinearEntity {
+        common,
+        point13: (0.0, 0.0, 0.0),
+        point14: (0.0, 0.0, 0.0),
+        point10: (0.0, 0.0, 0.0),
+        ext_line_rotation: 0.0,
+        dim_rotation: 0.0,
+        point15: None,
+        point16: None,
+    }
+}
+
+fn decode_dim_linear_like_entity_minimal_for_version(
+    reader: &mut BitReader<'_>,
+    version: &version::DwgVersion,
+    header: &ApiObjectHeader,
+    object_handle: u64,
+) -> crate::core::result::Result<entities::DimLinearEntity> {
+    let start = reader.get_pos();
+    let mut parsed_header = match version {
+        version::DwgVersion::R2010 => parse_dim_common_header_r2010_plus_with_candidates(
+            reader,
+            header,
+            entities::common::parse_common_entity_header_r2010,
+        ),
+        version::DwgVersion::R2013 | version::DwgVersion::R2018 => {
+            parse_dim_common_header_r2010_plus_with_candidates(
+                reader,
+                header,
+                entities::common::parse_common_entity_header_r2013,
+            )
+        }
+        version::DwgVersion::R2007 => {
+            entities::common::parse_common_entity_header_r2007(reader).ok()
+        }
+        version::DwgVersion::R13 | version::DwgVersion::R14 => entities::common::parse_common_entity_header_r14(reader).ok(),
+        _ => entities::common::parse_common_entity_header(reader).ok(),
+    };
+
+    if parsed_header.is_none() {
+        for parser in [
+            entities::common::parse_common_entity_header_r2007
+                as fn(
+                    &mut BitReader<'_>,
+                )
+                    -> crate::core::result::Result<entities::common::CommonEntityHeader>,
+            entities::common::parse_common_entity_header,
+            entities::common::parse_common_entity_header_r14,
+        ] {
+            reader.set_pos(start.0, start.1);
+            if let Ok(candidate) = parser(reader) {
+                parsed_header = Some(candidate);
+                break;
+            }
+        }
+    }
+
+    let mut common_header = parsed_header.ok_or_else(|| {
+        DwgError::new(
+            ErrorKind::Decode,
+            "failed to minimally decode dimension common header",
+        )
+    })?;
+    if matches!(
+        version,
+        version::DwgVersion::R2010 | version::DwgVersion::R2013 | version::DwgVersion::R2018
+    ) {
+        common_header.handle = object_handle;
+    }
+
+    // Handle stream: the common entity handles, then DIMSTYLE and the
+    // anonymous BLOCK (ODA spec 20.4.22).
+    reader.set_bit_pos(common_header.obj_size);
+    let (layer_handle, dimstyle_handle, anonymous_block_handle) =
+        match entities::common::parse_common_entity_handles(reader, &common_header) {
+            Ok(common_handles) => (
+                common_handles.layer,
+                entities::common::read_handle_reference(reader, common_header.handle).ok(),
+                entities::common::read_handle_reference(reader, common_header.handle).ok(),
+            ),
+            Err(_) => (0, None, None),
+        };
+
+    let common = entities::DimensionCommonData {
+        handle: common_header.handle,
+        color_index: common_header.color.index,
+        true_color: common_header.color.true_color,
+        layer_handle,
+        extrusion: (0.0, 0.0, 1.0),
+        text_midpoint: (0.0, 0.0, 0.0),
+        elevation: 0.0,
+        dim_flags: 0,
+        user_text: String::new(),
+        text_rotation: 0.0,
+        horizontal_direction: 0.0,
+        insert_scale: (1.0, 1.0, 1.0),
+        insert_rotation: 0.0,
+        attachment_point: None,
+        line_spacing_style: None,
+        line_spacing_factor: None,
+        actual_measurement: None,
+        insert_point: None,
+        dimstyle_handle,
+        anonymous_block_handle,
+    };
+
+    Ok(entities::DimLinearEntity {
+        common,
+        point13: (0.0, 0.0, 0.0),
+        point14: (0.0, 0.0, 0.0),
+        point10: (0.0, 0.0, 0.0),
+        ext_line_rotation: 0.0,
+        dim_rotation: 0.0,
+        point15: None,
+        point16: None,
+    })
+}
+
+const IMPLAUSIBLE_DIMENSION_CANDIDATE_SCORE: u64 = 100_000;
+
+fn is_implausible_dimension_candidate(entity: &entities::DimLinearEntity) -> bool {
+    dim_linear_entity_plausibility_score(entity) >= IMPLAUSIBLE_DIMENSION_CANDIDATE_SCORE
+}
+
+fn dim_linear_entity_plausibility_score(entity: &entities::DimLinearEntity) -> u64 {
+    let mut score = 0u64;
+    let common = &entity.common;
+
+    for point in [
+        entity.point10,
+        entity.point13,
+        entity.point14,
+        common.text_midpoint,
+    ] {
+        score = score.saturating_add(point_plausibility_score(point));
+    }
+    if let Some(insert_point) = common.insert_point {
+        score = score.saturating_add(point_plausibility_score(insert_point));
+    }
+    score = score.saturating_add(point_plausibility_score(common.extrusion));
+    score = score.saturating_add(point_plausibility_score(common.insert_scale));
+
+    if common.extrusion.0 == 0.0 && common.extrusion.1 == 0.0 && common.extrusion.2 == 0.0 {
+        score = score.saturating_add(50_000);
+    }
+
+    for angle in [
+        common.text_rotation,
+        common.horizontal_direction,
+        entity.ext_line_rotation,
+        entity.dim_rotation,
+        common.insert_rotation,
+    ] {
+        if !angle.is_finite() {
+            score = score.saturating_add(100_000);
+        } else if angle.abs() > 1.0e6 {
+            score = score.saturating_add(10_000);
+        } else if angle.abs() > 1.0e4 {
+            score = score.saturating_add(100);
+        }
+    }
+
+    if let Some(actual_measurement) = common.actual_measurement {
+        score = score.saturating_add(value_plausibility_score(actual_measurement));
+    }
+    if let Some(line_spacing_factor) = common.line_spacing_factor {
+        score = score.saturating_add(value_plausibility_score(line_spacing_factor));
+    }
+
+    if let Some(attachment_point) = common.attachment_point {
+        if attachment_point > 9 {
+            score = score.saturating_add(10_000);
+        }
+    }
+    if let Some(line_spacing_style) = common.line_spacing_style {
+        if line_spacing_style > 2 {
+            score = score.saturating_add(10_000);
+        }
+    }
+    if common.dim_flags > 0x7F {
+        score = score.saturating_add(1_000);
+    }
+    score = score.saturating_add(dimension_text_plausibility_penalty(&common.user_text));
+
+    score
+}
+
+fn dimension_text_plausibility_penalty(text: &str) -> u64 {
+    if text.is_empty() || text == "<>" {
+        return 0;
+    }
+
+    let len = text.chars().count();
+    if len > 512 {
+        return IMPLAUSIBLE_DIMENSION_CANDIDATE_SCORE.saturating_mul(2);
+    }
+
+    let mut score = 0i64;
+    let mut control_count = 0u64;
+    let mut replacement_count = 0u64;
+    let mut private_use_count = 0u64;
+    for ch in text.chars() {
+        if ch == '\n' || ch == '\r' {
+            control_count = control_count.saturating_add(1);
+        }
+        if ch == '\u{FFFD}' {
+            replacement_count = replacement_count.saturating_add(1);
+        }
+        if ('\u{E000}'..='\u{F8FF}').contains(&ch) {
+            private_use_count = private_use_count.saturating_add(1);
+        }
+        score += dimension_text_char_score(ch);
+    }
+
+    let mut penalty = 0u64;
+    penalty = penalty.saturating_add(
+        control_count.saturating_mul(IMPLAUSIBLE_DIMENSION_CANDIDATE_SCORE),
+    );
+    penalty = penalty.saturating_add(replacement_count.saturating_mul(50_000));
+    penalty = penalty.saturating_add(private_use_count.saturating_mul(50_000));
+
+    if score < -(len as i64 / 2) {
+        penalty = penalty.saturating_add(IMPLAUSIBLE_DIMENSION_CANDIDATE_SCORE);
+    } else if score < 0 {
+        penalty = penalty.saturating_add((-score as u64).saturating_mul(64));
+    }
+
+    if text.matches("*D").take(2).count() >= 2 {
+        penalty = penalty.saturating_add(IMPLAUSIBLE_DIMENSION_CANDIDATE_SCORE);
+    }
+
+    penalty
+}
+
+fn dimension_text_char_score(ch: char) -> i64 {
+    if ch == '\u{FFFD}' || ('\u{E000}'..='\u{F8FF}').contains(&ch) {
+        return -6;
+    }
+    if ch.is_control() {
+        return if matches!(ch, '\n' | '\r' | '\t') { -5 } else { -6 };
+    }
+    if ch.is_ascii_alphanumeric() {
+        return 2;
+    }
+    if ch.is_ascii_punctuation() || ch.is_ascii_whitespace() {
+        return 1;
+    }
+    if matches!(
+        ch,
+        '\u{3000}'..='\u{303F}'
+            | '\u{3040}'..='\u{309F}'
+            | '\u{30A0}'..='\u{30FF}'
+            | '\u{3400}'..='\u{4DBF}'
+            | '\u{4E00}'..='\u{9FFF}'
+            | '\u{FF01}'..='\u{FF60}'
+            | '\u{FFE0}'..='\u{FFE6}'
+    ) {
+        return 2;
+    }
+    if ch.is_alphabetic() || ch.is_numeric() || ch.is_whitespace() {
+        return 1;
+    }
+    -2
+}
+
+fn dim_entity_row_from_linear_like(entity: &entities::DimLinearEntity) -> DimEntityRow {
+    let common = &entity.common;
+    (
+        common.handle,
+        common.user_text.clone(),
+        entity.point10,
+        entity.point13,
+        entity.point14,
+        common.text_midpoint,
+        common.insert_point,
+        (common.extrusion, common.insert_scale),
+        (
+            common.text_rotation,
+            common.horizontal_direction,
+            entity.ext_line_rotation,
+            entity.dim_rotation,
+        ),
+        (
+            common.dim_flags,
+            common.actual_measurement,
+            common.attachment_point,
+            common.line_spacing_style,
+            common.line_spacing_factor,
+            common.insert_rotation,
+        ),
+        (
+            common.dimstyle_handle,
+            // A null handle: the dimension has no anonymous block.
+            common.anonymous_block_handle.filter(|handle| *handle != 0),
+        ),
+        (entity.point15, entity.point16),
+    )
+}
+
+impl_version_dispatch! {
+    with_r14;
+    fn decode_dim_linear_for_version -> entities::DimLinearEntity;
+    r14: entities::decode_dim_linear_r14;
+    r2010: entities::decode_dim_linear_r2010;
+    r2013: entities::decode_dim_linear_r2013;
+    r2007: entities::decode_dim_linear_r2007;
+    default: entities::decode_dim_linear;
+}
+
+/// Version dispatch for the dimension types that share the LINEAR-like entity
+/// but have their own type-specific tail (ODA spec 20.4.22-20.4.25).
+macro_rules! impl_dim_layout_dispatch {
+    (fn $fn_name:ident => $layout:expr) => {
+        fn $fn_name(
+            reader: &mut BitReader<'_>,
+            version: &version::DwgVersion,
+            header: &ApiObjectHeader,
+            object_handle: u64,
+        ) -> crate::core::result::Result<entities::DimLinearEntity> {
+            match version {
+                version::DwgVersion::R2010 => {
+                    let object_data_end_bit = resolve_r2010_object_data_end_bit(header)?;
+                    entities::decode_dim_layout_r2010(
+                        reader,
+                        object_data_end_bit,
+                        object_handle,
+                        $layout,
+                    )
+                }
+                version::DwgVersion::R2013 | version::DwgVersion::R2018 => {
+                    let object_data_end_bit = resolve_r2010_object_data_end_bit(header)?;
+                    entities::decode_dim_layout_r2013(
+                        reader,
+                        object_data_end_bit,
+                        object_handle,
+                        $layout,
+                    )
+                }
+                version::DwgVersion::R2007 => entities::decode_dim_layout_r2007(reader, $layout),
+                version::DwgVersion::R13 | version::DwgVersion::R14 => {
+                    entities::decode_dim_layout_r14(reader, object_handle, $layout)
+                }
+                _ => entities::decode_dim_layout(reader, $layout),
+            }
+        }
+    };
+}
+
+impl_dim_layout_dispatch!(fn decode_dim_ordinate_for_version => entities::DimSpecificLayout::Ordinate);
+impl_dim_layout_dispatch!(fn decode_dim_aligned_for_version => entities::DimSpecificLayout::Aligned);
+impl_dim_layout_dispatch!(fn decode_dim_ang3pt_for_version => entities::DimSpecificLayout::Ang3Pt);
+impl_dim_layout_dispatch!(fn decode_dim_ang2ln_for_version => entities::DimSpecificLayout::Ang2Ln);
+
+impl_version_dispatch! {
+    with_r14;
+    fn decode_dim_radius_for_version -> entities::DimRadiusEntity;
+    r14: entities::decode_dim_radius_r14;
+    r2010: entities::decode_dim_radius_r2010;
+    r2013: entities::decode_dim_radius_r2013;
+    r2007: entities::decode_dim_radius_r2007;
+    default: entities::decode_dim_radius;
+}
+
+impl_version_dispatch! {
+    with_r14;
+    fn decode_dim_diameter_for_version -> entities::DimDiameterEntity;
+    r14: entities::decode_dim_diameter_r14;
+    r2010: entities::decode_dim_diameter_r2010;
+    r2013: entities::decode_dim_diameter_r2013;
+    r2007: entities::decode_dim_diameter_r2007;
+    default: entities::decode_dim_diameter;
+}
+
+fn recover_dimension_anonymous_block_handle_r2010_plus(
+    record: &objects::ObjectRecord<'_>,
+    version: &version::DwgVersion,
+    api_header: &ApiObjectHeader,
+    object_handle: u64,
+    parsed_block_handle: Option<u64>,
+    known_block_handles: &HashSet<u64>,
+    named_block_handles: &HashSet<u64>,
+    block_header_names: &HashMap<u64, String>,
+) -> Option<u64> {
+    if !matches!(
+        version,
+        version::DwgVersion::R2010 | version::DwgVersion::R2013 | version::DwgVersion::R2018
+    ) {
+        return parsed_block_handle;
+    }
+    if known_block_handles.is_empty() {
+        return parsed_block_handle;
+    }
+
+    let parsed_block_handle = parsed_block_handle.filter(|handle| *handle != 0);
+    // The handle read at its place in the handle stream is authoritative when
+    // it names a block; the scan below only recovers records where it does not.
+    if parsed_block_handle.is_some_and(|handle| known_block_handles.contains(&handle)) {
+        return parsed_block_handle;
+    }
+
+    let mut base_handles = vec![object_handle];
+    if object_handle > 1 {
+        base_handles.push(object_handle - 1);
+    }
+    base_handles.push(object_handle.saturating_add(1));
+    if object_handle > 2 {
+        base_handles.push(object_handle - 2);
+    }
+    base_handles.push(object_handle.saturating_add(2));
+
+    let mut base_reader = record.bit_reader();
+    if skip_object_type_prefix(&mut base_reader, version).is_ok() {
+        if let Ok(record_handle) = base_reader.read_h() {
+            if record_handle.value != 0 {
+                base_handles.push(record_handle.value);
+                if record_handle.value > 1 {
+                    base_handles.push(record_handle.value - 1);
+                }
+                base_handles.push(record_handle.value.saturating_add(1));
+            }
+        }
+    }
+    base_handles.sort_unstable();
+    base_handles.dedup();
+
+    let mut end_bits = resolve_r2010_object_data_end_bit_candidates(api_header);
+    if let Ok(canonical) = resolve_r2010_object_data_end_bit(api_header) {
+        for delta in (-256i32..=256).step_by(8) {
+            let candidate_i64 = i64::from(canonical) + i64::from(delta);
+            if candidate_i64 < 0 {
+                continue;
+            }
+            if let Ok(candidate) = u32::try_from(candidate_i64) {
+                end_bits.push(candidate);
+            }
+        }
+    }
+    let mut stream_size_reader = record.bit_reader();
+    if skip_object_type_prefix(&mut stream_size_reader, version).is_ok() {
+        if let Ok(obj_size_bits) = stream_size_reader.read_rl(Endian::Little) {
+            for delta in (-128i32..=128).step_by(8) {
+                let candidate_i64 = i64::from(obj_size_bits) + i64::from(delta);
+                if candidate_i64 < 0 {
+                    continue;
+                }
+                if let Ok(candidate) = u32::try_from(candidate_i64) {
+                    end_bits.push(candidate);
+                }
+            }
+        }
+    }
+    let total_bits = api_header.data_size.saturating_mul(8);
+    end_bits.push(total_bits);
+    end_bits.retain(|candidate| *candidate <= total_bits);
+    end_bits.sort_unstable();
+    end_bits.dedup();
+
+    let expected_end_bit = resolve_r2010_object_data_end_bit(api_header).ok();
+    let mut best: Option<(u64, u64)> = None;
+    if let Some(handle) = parsed_block_handle {
+        if known_block_handles.contains(&handle) {
+            let mut score = dimension_block_name_penalty(handle, block_header_names);
+            if !named_block_handles.is_empty() && named_block_handles.contains(&handle) {
+                score = score.saturating_sub(8);
+            }
+            best = Some((score, handle));
+        }
+    }
+    for end_bit in end_bits.iter().copied() {
+        for base_handle in base_handles.iter().copied() {
+            let mut reader = record.bit_reader();
+            if skip_object_type_prefix(&mut reader, version).is_err() {
+                continue;
+            }
+            let mut common_header = match version {
+                version::DwgVersion::R2010 => {
+                    match entities::common::parse_common_entity_header_r2010(&mut reader, end_bit) {
+                        Ok(header) => header,
+                        Err(_) => continue,
+                    }
+                }
+                version::DwgVersion::R2013 | version::DwgVersion::R2018 => {
+                    match entities::common::parse_common_entity_header_r2013(&mut reader, end_bit) {
+                        Ok(header) => header,
+                        Err(_) => continue,
+                    }
+                }
+                _ => continue,
+            };
+            common_header.handle = base_handle;
+            reader.set_bit_pos(common_header.obj_size);
+            if entities::common::read_handle_reference(&mut reader, common_header.handle).is_err() {
+                continue;
+            }
+            let block_handle =
+                match entities::common::read_handle_reference(&mut reader, common_header.handle) {
+                    Ok(handle) => handle,
+                    Err(_) => continue,
+                };
+            if !known_block_handles.contains(&block_handle) {
+                continue;
+            }
+            let mut score = expected_end_bit
+                .map(|expected| expected.abs_diff(end_bit) as u64)
+                .unwrap_or(0)
+                .saturating_mul(4);
+            if base_handle != object_handle {
+                score = score.saturating_add(24);
+            }
+            if Some(block_handle) == parsed_block_handle {
+                score = score.saturating_sub(16);
+            }
+            if !named_block_handles.is_empty() && named_block_handles.contains(&block_handle) {
+                score = score.saturating_sub(8);
+            }
+            score = score.saturating_add(
+                dimension_block_name_penalty(block_handle, block_header_names),
+            );
+            match best {
+                Some((best_score, _)) if best_score <= score => {}
+                _ => best = Some((score, block_handle)),
+            }
+        }
+    }
+
+    let expected_end_bit = resolve_r2010_object_data_end_bit(api_header).ok();
+    for end_bit in end_bits {
+        for base_handle in base_handles.iter().copied() {
+            for chained_base in [false, true] {
+                let mut reader = record.bit_reader();
+                if skip_object_type_prefix(&mut reader, version).is_err() {
+                    continue;
+                }
+                reader.set_bit_pos(end_bit);
+                let mut prev_handle = base_handle;
+                for index in 0..256u64 {
+                    let candidate = if chained_base {
+                        match read_handle_reference_chained(&mut reader, &mut prev_handle) {
+                            Ok(value) => value,
+                            Err(_) => break,
+                        }
+                    } else {
+                        match entities::common::read_handle_reference(&mut reader, base_handle) {
+                            Ok(value) => value,
+                            Err(_) => break,
+                        }
+                    };
+                    if !known_block_handles.contains(&candidate) {
+                        continue;
+                    }
+                    let mut score = index.saturating_mul(64);
+                    if let Some(expected) = expected_end_bit {
+                        score = score.saturating_add(expected.abs_diff(end_bit) as u64);
+                    }
+                    if base_handle != object_handle {
+                        score = score.saturating_add(24);
+                    }
+                    if Some(candidate) == parsed_block_handle {
+                        score = score.saturating_sub(12);
+                    }
+                    if !named_block_handles.is_empty() && named_block_handles.contains(&candidate) {
+                        score = score.saturating_sub(8);
+                    }
+                    score =
+                        score.saturating_add(dimension_block_name_penalty(candidate, block_header_names));
+                    if !chained_base {
+                        score = score.saturating_add(6);
+                    } else {
+                        score = score.saturating_add(18);
+                    }
+                    match best {
+                        Some((best_score, _)) if best_score <= score => {}
+                        _ => best = Some((score, candidate)),
+                    }
+                }
+            }
+        }
+    }
+
+    best.map(|(_, handle)| handle).or(parsed_block_handle)
+}
+
+fn dimension_block_name_penalty(
+    handle: u64,
+    block_header_names: &HashMap<u64, String>,
+) -> u64 {
+    let Some(raw_name) = block_header_names.get(&handle) else {
+        return 96;
+    };
+    let name = raw_name.trim();
+    if name.is_empty() {
+        return 96;
+    }
+    let upper = name.to_ascii_uppercase();
+    if upper == "*D" {
+        // Many drawings contain placeholder duplicate "*D" names; selecting
+        // them eagerly collapses distinct anonymous dimension graphics.
+        return 1024;
+    }
+    if let Some(suffix) = upper.strip_prefix("*D") {
+        if !suffix.is_empty() && suffix.chars().all(|ch| ch.is_ascii_digit()) {
+            return 0;
+        }
+        return 80;
+    }
+    if upper.starts_with('*') {
+        return 160;
+    }
+    240
+}
+
+#[cfg(test)]
+mod dimension_tests {
+    use super::{
+        dimension_text_plausibility_penalty, is_implausible_dimension_candidate,
+        IMPLAUSIBLE_DIMENSION_CANDIDATE_SCORE,
+    };
+    use crate::entities::{DimLinearEntity, DimensionCommonData};
+
+    fn base_entity() -> DimLinearEntity {
+        DimLinearEntity {
+            common: DimensionCommonData {
+                handle: 1,
+                color_index: None,
+                true_color: None,
+                layer_handle: 0,
+                extrusion: (0.0, 0.0, 1.0),
+                text_midpoint: (10.0, 10.0, 0.0),
+                elevation: 0.0,
+                dim_flags: 0,
+                user_text: "<>".to_string(),
+                text_rotation: 0.0,
+                horizontal_direction: 0.0,
+                insert_scale: (1.0, 1.0, 1.0),
+                insert_rotation: 0.0,
+                attachment_point: None,
+                line_spacing_style: None,
+                line_spacing_factor: None,
+                actual_measurement: Some(10.0),
+                insert_point: Some((10.0, 10.0, 0.0)),
+                dimstyle_handle: None,
+                anonymous_block_handle: None,
+            },
+            point13: (0.0, 0.0, 0.0),
+            point14: (20.0, 0.0, 0.0),
+            point10: (20.0, 5.0, 0.0),
+            ext_line_rotation: 0.0,
+            dim_rotation: 0.0,
+            point15: None,
+            point16: None,
+        }
+    }
+
+    #[test]
+    fn dimension_text_penalty_keeps_normal_dimension_text() {
+        assert_eq!(dimension_text_plausibility_penalty(r"\A1;開口 <>"), 0);
+    }
+
+    #[test]
+    fn dimension_text_penalty_rejects_literal_line_breaks() {
+        assert!(
+            dimension_text_plausibility_penalty("bad\ntext")
+                >= IMPLAUSIBLE_DIMENSION_CANDIDATE_SCORE
+            );
+    }
+
+    #[test]
+    fn implausible_dimension_candidate_rejects_corrupt_user_text() {
+        let mut entity = base_entity();
+        entity.common.user_text = "bad\ntext".to_string();
+        assert!(is_implausible_dimension_candidate(&entity));
+    }
+}

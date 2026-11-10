@@ -1,0 +1,44 @@
+[project]
+name = "ezdwg"
+dynamic = ["version"]
+description = "Minimal read-only DWG parser (Rust core + Python API)"
+readme = "README.md"
+authors = [
+    { name = "neka-nat", email = "nekanat.stock@gmail.com" }
+]
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+
+[project.optional-dependencies]
+plot = ["matplotlib>=3.8"]
+dxf = ["ezdxf>=1.4"]
+
+[project.scripts]
+ezdwg = "ezdwg:main"
+
+[tool.maturin]
+manifest-path = "crates/ezdwg-python/Cargo.toml"
+module-name = "ezdwg._core"
+python-packages = ["ezdwg"]
+python-source = "src"
+
+[tool.uv]
+cache-keys = [
+    { file = "pyproject.toml" },
+    { file = "Cargo.toml" },
+    { file = "Cargo.lock" },
+    { file = "crates/**/*.toml" },
+    { file = "crates/**/*.rs" },
+]
+
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[dependency-groups]
+dev = [
+    "mkdocs-glightbox>=0.5.2",
+    "mkdocs-material>=9.7.2",
+    "mkdocstrings[python]>=1.0.3",
+]

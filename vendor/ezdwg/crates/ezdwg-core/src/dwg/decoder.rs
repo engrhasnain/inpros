@@ -1,0 +1,253 @@
+use crate::container::{SectionDirectory, SectionSlice};
+use crate::core::config::ParseConfig;
+use crate::core::error::{DwgError, ErrorKind};
+use crate::core::result::Result;
+use crate::dwg::header::{self, HeaderVariables};
+use crate::dwg::r2000;
+use crate::dwg::r2004;
+use crate::dwg::r2007;
+use crate::dwg::version::{detect_version, DwgVersion};
+use crate::objects::{ObjectClass, ObjectIndex, ObjectRecord};
+use std::collections::HashMap;
+use std::sync::{Arc, OnceLock};
+
+const FILE_HEADER_CODEPAGE_OFFSET: usize = 0x13;
+
+#[derive(Debug)]
+pub struct Decoder<'a> {
+    bytes: &'a [u8],
+    version: DwgVersion,
+    codepage: Option<u16>,
+    config: ParseConfig,
+    objects_section_cache: OnceLock<Arc<Vec<u8>>>,
+}
+
+impl<'a> Decoder<'a> {
+    pub fn new(bytes: &'a [u8], config: ParseConfig) -> Result<Self> {
+        let version = detect_version(bytes)?;
+        Ok(Self {
+            bytes,
+            version,
+            codepage: detect_codepage(bytes),
+            config,
+            objects_section_cache: OnceLock::new(),
+        })
+    }
+
+    pub fn version(&self) -> &DwgVersion {
+        &self.version
+    }
+
+    /// Reuse the objects section another `Decoder` of the same bytes already
+    /// decompressed (R2004+/R2007). Decompressing it is most of the fixed cost
+    /// of every pass over a large drawing.
+    pub fn with_objects_section(self, section: Arc<Vec<u8>>) -> Self {
+        let _ = self.objects_section_cache.set(section);
+        self
+    }
+
+    /// The decompressed objects section, if a record was parsed (or it was
+    /// handed in) already; `None` for R13-R2000, whose records live in `bytes`.
+    pub fn objects_section(&self) -> Option<Arc<Vec<u8>>> {
+        self.objects_section_cache.get().cloned()
+    }
+
+    pub fn codepage(&self) -> Option<u16> {
+        self.codepage
+    }
+
+    pub fn ensure_supported(&self) -> Result<()> {
+        match self.version {
+            DwgVersion::R13
+            | DwgVersion::R14
+            | DwgVersion::R2000
+            | DwgVersion::R2004
+            | DwgVersion::R2007
+            | DwgVersion::R2010
+            | DwgVersion::R2013
+            | DwgVersion::R2018 => Ok(()),
+            DwgVersion::Unknown(_) => Err(DwgError::new(
+                ErrorKind::Unsupported,
+                format!("unsupported DWG version: {}", self.version.as_str()),
+            )),
+        }
+    }
+
+    pub fn section_directory(&self) -> Result<SectionDirectory> {
+        match self.version {
+            DwgVersion::R13 | DwgVersion::R14 | DwgVersion::R2000 => {
+                r2000::parse_section_directory(self.bytes, &self.config)
+            }
+            DwgVersion::R2004 | DwgVersion::R2010 | DwgVersion::R2013 | DwgVersion::R2018 => {
+                r2004::parse_section_directory(self.bytes, &self.config)
+            }
+            DwgVersion::R2007 => r2007::parse_section_directory(self.bytes, &self.config),
+            DwgVersion::Unknown(_) => Err(DwgError::new(
+                ErrorKind::Unsupported,
+                format!("unsupported DWG version: {}", self.version.as_str()),
+            )),
+        }
+    }
+
+    pub fn load_section_by_index(
+        &self,
+        directory: &SectionDirectory,
+        index: usize,
+    ) -> Result<SectionSlice<'a>> {
+        match self.version {
+            DwgVersion::R13 | DwgVersion::R14 | DwgVersion::R2000 => {
+                r2000::load_section_by_index(self.bytes, directory, index, &self.config)
+            }
+            DwgVersion::R2004 | DwgVersion::R2010 | DwgVersion::R2013 | DwgVersion::R2018 => {
+                r2004::load_section_by_index(self.bytes, directory, index, &self.config)
+            }
+            DwgVersion::R2007 => {
+                r2007::load_section_by_index(self.bytes, directory, index, &self.config)
+            }
+            DwgVersion::Unknown(_) => Err(DwgError::new(
+                ErrorKind::Unsupported,
+                format!("unsupported DWG version: {}", self.version.as_str()),
+            )),
+        }
+    }
+
+    /// Decode the header-variables subset ($INSUNITS, unit formats, extents).
+    ///
+    /// R14 files have no INSUNITS header variable and yield a result with
+    /// every field set to `None`.
+    pub fn header_variables(&self) -> Result<HeaderVariables> {
+        if matches!(self.version, DwgVersion::R13 | DwgVersion::R14) {
+            return Ok(HeaderVariables::default());
+        }
+        let directory = self.section_directory()?;
+        let index = directory
+            .records
+            .iter()
+            .position(|record| record.name.as_deref() == Some("AcDb:Header"))
+            .unwrap_or(0);
+        let section = self.load_section_by_index(&directory, index)?;
+        header::decode_header_variables(section.data.as_ref(), &self.version, self.codepage)
+    }
+
+    pub fn build_object_index(&self) -> Result<ObjectIndex> {
+        match self.version {
+            DwgVersion::R13 | DwgVersion::R14 | DwgVersion::R2000 => {
+                r2000::build_object_index(self.bytes, &self.config)
+            }
+            DwgVersion::R2004 | DwgVersion::R2010 | DwgVersion::R2013 | DwgVersion::R2018 => {
+                r2004::build_object_index(self.bytes, &self.config)
+            }
+            DwgVersion::R2007 => r2007::build_object_index(self.bytes, &self.config),
+            DwgVersion::Unknown(_) => Err(DwgError::new(
+                ErrorKind::Unsupported,
+                format!("unsupported DWG version: {}", self.version.as_str()),
+            )),
+        }
+    }
+
+    pub fn parse_object_record(&self, offset: u32) -> Result<ObjectRecord<'a>> {
+        match self.version {
+            DwgVersion::R13 | DwgVersion::R14 | DwgVersion::R2000 => {
+                let pre_r2004_layout = matches!(self.version, DwgVersion::R2000);
+                r2000::parse_object_record(self.bytes, offset).map(|record| {
+                    record
+                        .with_codepage(self.codepage)
+                        .with_pre_r2004_layout(pre_r2004_layout)
+                })
+            }
+            DwgVersion::R2004 => {
+                let data = self.load_objects_section_data()?;
+                r2004::parse_object_record_from_section_data(data, offset)
+                    .map(|record| record.with_codepage(self.codepage))
+            }
+            DwgVersion::R2010 | DwgVersion::R2013 | DwgVersion::R2018 => {
+                let data = self.load_objects_section_data()?;
+                r2004::parse_object_record_from_section_data_r2010(data, offset)
+                    .map(|record| record.with_codepage(self.codepage))
+            }
+            DwgVersion::R2007 => {
+                let data = self.load_objects_section_data()?;
+                r2007::parse_object_record_from_section_data(data, offset)
+                    .map(|record| record.with_codepage(self.codepage))
+            }
+            DwgVersion::Unknown(_) => Err(DwgError::new(
+                ErrorKind::Unsupported,
+                format!("unsupported DWG version: {}", self.version.as_str()),
+            )),
+        }
+    }
+
+    pub fn dynamic_type_map(&self) -> Result<HashMap<u16, String>> {
+        match self.version {
+            DwgVersion::R13 | DwgVersion::R14 | DwgVersion::R2000 => {
+                match r2000::load_dynamic_type_map(self.bytes, &self.config) {
+                    Ok(map) => Ok(map),
+                    Err(_err) => Ok(HashMap::new()),
+                }
+            }
+            DwgVersion::R2004 => r2004::load_dynamic_type_map(self.bytes, &self.config),
+            DwgVersion::R2010 => r2004::load_dynamic_type_map_r21(self.bytes, &self.config),
+            DwgVersion::R2007 => r2007::load_dynamic_type_map(self.bytes, &self.config),
+            DwgVersion::R2013 | DwgVersion::R2018 => {
+                r2004::load_dynamic_type_map_r21(self.bytes, &self.config)
+            }
+            DwgVersion::Unknown(_) => Err(DwgError::new(
+                ErrorKind::Unsupported,
+                format!("unsupported DWG version: {}", self.version.as_str()),
+            )),
+        }
+    }
+
+    pub fn dynamic_type_class_map(&self) -> Result<HashMap<u16, ObjectClass>> {
+        match self.version {
+            DwgVersion::R13 | DwgVersion::R14 | DwgVersion::R2000 => {
+                match r2000::load_dynamic_type_class_map(self.bytes, &self.config) {
+                    Ok(map) => Ok(map),
+                    Err(_err) => Ok(HashMap::new()),
+                }
+            }
+            DwgVersion::R2004 => r2004::load_dynamic_type_class_map(self.bytes, &self.config),
+            DwgVersion::R2010 => r2004::load_dynamic_type_class_map_r21(self.bytes, &self.config),
+            DwgVersion::R2007 => r2007::load_dynamic_type_class_map(self.bytes, &self.config),
+            DwgVersion::R2013 | DwgVersion::R2018 => {
+                r2004::load_dynamic_type_class_map_r21(self.bytes, &self.config)
+            }
+            DwgVersion::Unknown(_) => Err(DwgError::new(
+                ErrorKind::Unsupported,
+                format!("unsupported DWG version: {}", self.version.as_str()),
+            )),
+        }
+    }
+
+    fn load_objects_section_data(&self) -> Result<&[u8]> {
+        if let Some(data) = self.objects_section_cache.get() {
+            return Ok(data.as_slice());
+        }
+
+        let loaded = match self.version {
+            DwgVersion::R2004 | DwgVersion::R2010 | DwgVersion::R2013 | DwgVersion::R2018 => {
+                r2004::load_objects_section_data(self.bytes, &self.config)?
+            }
+            DwgVersion::R2007 => r2007::load_objects_section_data(self.bytes, &self.config)?,
+            _ => {
+                return Err(DwgError::new(
+                    ErrorKind::Unsupported,
+                    format!("unsupported DWG version: {}", self.version.as_str()),
+                ))
+            }
+        };
+        let _ = self.objects_section_cache.set(Arc::new(loaded));
+        let data = self.objects_section_cache.get().ok_or_else(|| {
+            DwgError::new(
+                ErrorKind::Decode,
+                "failed to initialize objects section cache",
+            )
+        })?;
+        Ok(data.as_slice())
+    }
+}
+
+fn detect_codepage(bytes: &[u8]) -> Option<u16> {
+    let slice = bytes.get(FILE_HEADER_CODEPAGE_OFFSET..FILE_HEADER_CODEPAGE_OFFSET + 2)?;
+    Some(u16::from_le_bytes([slice[0], slice[1]]))
+}

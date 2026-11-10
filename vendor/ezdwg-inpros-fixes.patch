@@ -1,0 +1,213 @@
+diff --git a/crates/ezdwg-core/src/dwg/r2004.rs b/crates/ezdwg-core/src/dwg/r2004.rs
+index 92d6204..a6415aa 100644
+--- a/crates/ezdwg-core/src/dwg/r2004.rs
++++ b/crates/ezdwg-core/src/dwg/r2004.rs
+@@ -1581,6 +1581,9 @@ fn read_u16_be(reader: &mut ByteReader<'_>) -> Result<u16> {
+     Ok((hi << 8) | lo)
+ }
+ 
++const MAX_UNSIGNED_MODULAR_CHAR_BYTES: usize = 10;
++const MAX_SIGNED_MODULAR_CHAR_BYTES: usize = 9;
++
+ /// Object-map handle offsets are unsigned modular chars: the ODA specification
+ /// notes that "there is no negation used; handles in the object map are always
+ /// in increasing order". Decoding them with the signed reader turned every
+@@ -1591,7 +1594,10 @@ fn read_unsigned_modular_char(reader: &mut ByteReader<'_>) -> Result<i64> {
+     let mut value: i64 = 0;
+     let mut shift = 0;
+ 
+-    for _ in 0..5 {
++    // Handles are up to 8 bytes, i.e. up to 10 modular-char bytes. Drawings
++    // with large handseeds store 6-byte handle deltas; capping at 5 bytes
++    // desynchronised the rest of the map ("block exceeds remaining data").
++    for _ in 0..MAX_UNSIGNED_MODULAR_CHAR_BYTES {
+         let byte = reader.read_u8()?;
+         value |= ((byte & 0x7F) as i64) << shift;
+         if (byte & 0x80) == 0 {
+@@ -1599,14 +1605,14 @@ fn read_unsigned_modular_char(reader: &mut ByteReader<'_>) -> Result<i64> {
+         }
+         shift += 7;
+     }
+-    Ok(value)
++    Err(DwgError::new(ErrorKind::Format, "unsigned modular char too long").with_offset(reader.tell()))
+ }
+ 
+ fn read_modular_char(reader: &mut ByteReader<'_>) -> Result<i64> {
+     let mut value: i64 = 0;
+     let mut shift = 0;
+ 
+-    for _ in 0..4 {
++    for _ in 0..MAX_SIGNED_MODULAR_CHAR_BYTES {
+         let mut byte = reader.read_u8()?;
+         if (byte & 0x80) == 0 {
+             let negative = (byte & 0x40) != 0;
+@@ -1624,7 +1630,7 @@ fn read_modular_char(reader: &mut ByteReader<'_>) -> Result<i64> {
+         shift += 7;
+     }
+ 
+-    Ok(value)
++    Err(DwgError::new(ErrorKind::Format, "signed modular char too long").with_offset(reader.tell()))
+ }
+ 
+ // Unsigned modular char (UMC) -- per LibreDWG's reference decoder
+diff --git a/crates/ezdwg-core/src/dwg/r2007.rs b/crates/ezdwg-core/src/dwg/r2007.rs
+index e8cf2cf..0bf0873 100644
+--- a/crates/ezdwg-core/src/dwg/r2007.rs
++++ b/crates/ezdwg-core/src/dwg/r2007.rs
+@@ -608,6 +608,9 @@ fn read_u16_be(reader: &mut ByteReader<'_>) -> Result<u16> {
+     Ok((hi << 8) | lo)
+ }
+ 
++const MAX_UNSIGNED_MODULAR_CHAR_BYTES: usize = 10;
++const MAX_SIGNED_MODULAR_CHAR_BYTES: usize = 9;
++
+ /// Object-map handle offsets are unsigned modular chars: the ODA specification
+ /// notes that "there is no negation used; handles in the object map are always
+ /// in increasing order". Decoding them with the signed reader turned every
+@@ -618,7 +621,10 @@ fn read_unsigned_modular_char(reader: &mut ByteReader<'_>) -> Result<i64> {
+     let mut value: i64 = 0;
+     let mut shift = 0;
+ 
+-    for _ in 0..5 {
++    // Handles are up to 8 bytes, i.e. up to 10 modular-char bytes. Drawings
++    // with large handseeds store 6-byte handle deltas; capping at 5 bytes
++    // desynchronised the rest of the map ("block exceeds remaining data").
++    for _ in 0..MAX_UNSIGNED_MODULAR_CHAR_BYTES {
+         let byte = reader.read_u8()?;
+         value |= ((byte & 0x7F) as i64) << shift;
+         if (byte & 0x80) == 0 {
+@@ -626,14 +632,14 @@ fn read_unsigned_modular_char(reader: &mut ByteReader<'_>) -> Result<i64> {
+         }
+         shift += 7;
+     }
+-    Ok(value)
++    Err(DwgError::new(ErrorKind::Format, "unsigned modular char too long").with_offset(reader.tell()))
+ }
+ 
+ fn read_modular_char(reader: &mut ByteReader<'_>) -> Result<i64> {
+     let mut value: i64 = 0;
+     let mut shift = 0;
+ 
+-    for _ in 0..4 {
++    for _ in 0..MAX_SIGNED_MODULAR_CHAR_BYTES {
+         let mut byte = reader.read_u8()?;
+         if (byte & 0x80) == 0 {
+             let negative = (byte & 0x40) != 0;
+@@ -651,7 +657,7 @@ fn read_modular_char(reader: &mut ByteReader<'_>) -> Result<i64> {
+         shift += 7;
+     }
+ 
+-    Ok(value)
++    Err(DwgError::new(ErrorKind::Format, "signed modular char too long").with_offset(reader.tell()))
+ }
+ 
+ fn read_header_data(bytes: &[u8]) -> Result<HeaderData> {
+diff --git a/crates/ezdwg-core/src/objects/object_locator.rs b/crates/ezdwg-core/src/objects/object_locator.rs
+index 5de3679..6208d2f 100644
+--- a/crates/ezdwg-core/src/objects/object_locator.rs
++++ b/crates/ezdwg-core/src/objects/object_locator.rs
+@@ -167,6 +167,9 @@ fn read_u16_be(reader: &mut ByteReader<'_>) -> Result<u16> {
+     Ok((hi << 8) | lo)
+ }
+ 
++const MAX_UNSIGNED_MODULAR_CHAR_BYTES: usize = 10;
++const MAX_SIGNED_MODULAR_CHAR_BYTES: usize = 9;
++
+ /// Object-map handle offsets are unsigned modular chars: the ODA specification
+ /// notes that "there is no negation used; handles in the object map are always
+ /// in increasing order". Decoding them with the signed reader turned every
+@@ -177,7 +180,10 @@ fn read_unsigned_modular_char(reader: &mut ByteReader<'_>) -> Result<i64> {
+     let mut value: i64 = 0;
+     let mut shift = 0;
+ 
+-    for _ in 0..5 {
++    // Handles are up to 8 bytes, i.e. up to 10 modular-char bytes. Drawings
++    // with large handseeds store 6-byte handle deltas; capping at 5 bytes
++    // desynchronised the rest of the map ("block exceeds remaining data").
++    for _ in 0..MAX_UNSIGNED_MODULAR_CHAR_BYTES {
+         let byte = reader.read_u8()?;
+         value |= ((byte & 0x7F) as i64) << shift;
+         if (byte & 0x80) == 0 {
+@@ -185,14 +191,14 @@ fn read_unsigned_modular_char(reader: &mut ByteReader<'_>) -> Result<i64> {
+         }
+         shift += 7;
+     }
+-    Ok(value)
++    Err(DwgError::new(ErrorKind::Format, "unsigned modular char too long").with_offset(reader.tell()))
+ }
+ 
+ fn read_modular_char(reader: &mut ByteReader<'_>) -> Result<i64> {
+     let mut value: i64 = 0;
+     let mut shift = 0;
+ 
+-    for _ in 0..4 {
++    for _ in 0..MAX_SIGNED_MODULAR_CHAR_BYTES {
+         let mut byte = reader.read_u8()?;
+         if (byte & 0x80) == 0 {
+             let negative = (byte & 0x40) != 0;
+@@ -209,7 +215,7 @@ fn read_modular_char(reader: &mut ByteReader<'_>) -> Result<i64> {
+         value |= (byte as i64) << shift;
+         shift += 7;
+     }
+-    Ok(value)
++    Err(DwgError::new(ErrorKind::Format, "signed modular char too long").with_offset(reader.tell()))
+ }
+ 
+ #[cfg(test)]
+@@ -269,4 +275,36 @@ mod tests {
+         // offset: 10, 14, then reset -> 8, 11
+         assert_eq!(refs, vec![(1, 10), (3, 14), (7, 8), (9, 11)]);
+     }
++
++    #[test]
++    fn parse_object_map_accepts_six_byte_handle_delta() {
++        // Byte pattern from production AC1015 drawings: a handle delta that
++        // needs 6 modular-char bytes (0x1DC3808BF1). A 5-byte cap stopped
++        // mid-value and every following entry was decoded out of sync.
++        let bytes = vec![
++            0x00, 0x0D, // block: 2-byte header + 11-byte payload
++            0x01, 0x0A, // +1, +10
++            0xF1, 0x97, 0x82, 0x9C, 0xDC, 0x03, 0x04, // +0x1DC3808BF1, +4
++            0x01, 0x01, // +1, +1
++            0x00, 0x00, // crc
++            0x00, 0x02, // terminator block
++        ];
++        let index = parse_object_map(&bytes, &ParseConfig::default()).expect("index");
++        let refs: Vec<(u64, u32)> = index
++            .objects
++            .iter()
++            .map(|obj| (obj.handle.0, obj.offset))
++            .collect();
++        let big = 1 + 0x1D_C380_8BF1_u64;
++        assert_eq!(refs, vec![(1, 10), (big, 14), (big + 1, 15)]);
++    }
++
++    #[test]
++    fn parse_object_map_rejects_unterminated_modular_char() {
++        let mut bytes = vec![0x00, 0x0E];
++        bytes.extend_from_slice(&[0xFF; 11]); // never-ending modular char
++        bytes.extend_from_slice(&[0x01, 0x00, 0x00, 0x00, 0x02]);
++        let err = parse_object_map(&bytes, &ParseConfig::default()).unwrap_err();
++        assert!(err.to_string().contains("modular char too long"), "{err}");
++    }
+ }
+diff --git a/crates/ezdwg-python/src/api/bindings/block_insert.rs b/crates/ezdwg-python/src/api/bindings/block_insert.rs
+index 8c8588b..7f48c55 100644
+--- a/crates/ezdwg-python/src/api/bindings/block_insert.rs
++++ b/crates/ezdwg-python/src/api/bindings/block_insert.rs
+@@ -3207,10 +3207,15 @@ fn parse_insert_block_header_handle_from_common_header(
+ /// object type: R2010+ and R13/R14. The decoders of R2000-R2007 try the record
+ /// without that prefix first and fall back to it.
+ fn block_header_record_is_prefixed(version: &version::DwgVersion) -> bool {
++    // The record body of every version starts with the object type. R2000 was
++    // missing here: the unprefixed first attempt usually fails and the retry
++    // reads the name, but when the misaligned read happens to succeed (large
++    // block records whose preview bytes decode as text) a garbage name is kept.
+     matches!(
+         version,
+         version::DwgVersion::R13
+             | version::DwgVersion::R14
++            | version::DwgVersion::R2000
+             | version::DwgVersion::R2010
+             | version::DwgVersion::R2013
+             | version::DwgVersion::R2018

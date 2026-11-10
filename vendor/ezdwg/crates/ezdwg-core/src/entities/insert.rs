@@ -1,0 +1,193 @@
+use crate::bit::{BitReader, Endian};
+use crate::core::error::ErrorKind;
+use crate::core::result::Result;
+use crate::entities::common::{
+    parse_common_entity_handles, parse_common_entity_header,
+    parse_common_entity_header_r14_with_handle, parse_common_entity_header_r2007,
+    parse_common_entity_header_r2010, parse_common_entity_header_r2013,
+    parse_common_entity_layer_handle, read_handle_reference, CommonEntityHeader,
+};
+
+#[derive(Debug, Clone)]
+pub struct InsertEntity {
+    pub handle: u64,
+    pub position: (f64, f64, f64),
+    pub scale: (f64, f64, f64),
+    pub extrusion: (f64, f64, f64),
+    pub rotation: f64,
+    pub block_header_handle: Option<u64>,
+    /// R13-R2000: first/last endpoints; R2004+: ordered owned handles.
+    pub attribute_handles: Option<Vec<u64>>,
+    pub owner_handle: Option<u64>,
+}
+
+pub fn decode_insert(reader: &mut BitReader<'_>) -> Result<InsertEntity> {
+    let header = parse_common_entity_header(reader)?;
+    decode_insert_with_header(reader, header, false, false)
+}
+
+/// R13/R14 (ODA specification 20.4.9): the scale is three plain doubles and
+/// there is no owned object count.
+pub fn decode_insert_r14(reader: &mut BitReader<'_>, object_handle: u64) -> Result<InsertEntity> {
+    let header = parse_common_entity_header_r14_with_handle(reader, object_handle)?;
+    let position = reader.read_3bd()?;
+    let scale = reader.read_3bd()?;
+    let rotation = reader.read_bd()?;
+    let extrusion = reader.read_3bd()?;
+    let has_attribs = reader.read_b()?;
+
+    reader.set_bit_pos(header.obj_size);
+    let common_handles = parse_common_entity_handles(reader, &header)?;
+    let block_header_handle = read_handle_reference(reader, header.handle).ok();
+    let attribute_handles = if has_attribs == 0 {
+        Some(Vec::new())
+    } else {
+        (|| -> Result<Vec<u64>> {
+            let first = read_handle_reference(reader, header.handle)?;
+            let last = read_handle_reference(reader, header.handle)?;
+            read_handle_reference(reader, header.handle)?; // SEQEND
+            Ok(vec![first, last])
+        })()
+        .ok()
+    };
+
+    Ok(InsertEntity {
+        handle: header.handle,
+        position,
+        scale,
+        rotation,
+        extrusion,
+        block_header_handle,
+        owner_handle: common_handles.owner_ref,
+        attribute_handles,
+    })
+}
+
+pub fn decode_insert_r2007(reader: &mut BitReader<'_>) -> Result<InsertEntity> {
+    let header = parse_common_entity_header_r2007(reader)?;
+    decode_insert_with_header(reader, header, true, false)
+}
+
+pub fn decode_insert_r2010(
+    reader: &mut BitReader<'_>,
+    object_data_end_bit: u32,
+    object_handle: u64,
+) -> Result<InsertEntity> {
+    let header = parse_common_entity_header_r2010(reader, object_data_end_bit)?;
+    let mut entity = decode_insert_with_header(reader, header, true, false)?;
+    entity.handle = object_handle;
+    Ok(entity)
+}
+
+pub fn decode_insert_r2013(
+    reader: &mut BitReader<'_>,
+    object_data_end_bit: u32,
+    object_handle: u64,
+) -> Result<InsertEntity> {
+    let header = parse_common_entity_header_r2013(reader, object_data_end_bit)?;
+    let mut entity = decode_insert_with_header(reader, header, true, false)?;
+    entity.handle = object_handle;
+    Ok(entity)
+}
+
+fn decode_insert_with_header(
+    reader: &mut BitReader<'_>,
+    header: CommonEntityHeader,
+    allow_handle_decode_failure: bool,
+    r2007_layer_only: bool,
+) -> Result<InsertEntity> {
+    let position = reader.read_3bd()?;
+    let data_flags = reader.read_bb()?;
+
+    let (x_scale, y_scale, z_scale) = match data_flags {
+        0x03 => (1.0, 1.0, 1.0),
+        0x01 => {
+            let y = reader.read_dd(1.0)?;
+            let z = reader.read_dd(1.0)?;
+            (1.0, y, z)
+        }
+        0x02 => {
+            let x = reader.read_rd(Endian::Little)?;
+            (x, x, x)
+        }
+        _ => {
+            let x = reader.read_rd(Endian::Little)?;
+            let y = reader.read_dd(x)?;
+            let z = reader.read_dd(x)?;
+            (x, y, z)
+        }
+    };
+
+    let rotation = reader.read_bd()?;
+    let extrusion = reader.read_3bd()?;
+    let has_attribs = reader.read_b()?;
+    // R2004+ count the owned attributes; R2000 names the first and the last.
+    let owned_obj_count = if has_attribs == 1 && !reader.pre_r2004_layout() {
+        reader.read_bl()?
+    } else {
+        0
+    };
+
+    // INSERT keeps block and owned references in the handle stream.
+    let mut attribute_handles = if has_attribs == 0 {
+        Some(Vec::new())
+    } else {
+        None
+    };
+    let mut block_header_handle = None;
+    let mut owner_handle = None;
+    reader.set_bit_pos(header.obj_size);
+
+    let common_ok = if r2007_layer_only {
+        parse_common_entity_layer_handle(reader, &header).map(|_| ())
+    } else {
+        match parse_common_entity_handles(reader, &header) {
+            Ok(common_handles) => {
+                owner_handle = common_handles.owner_ref;
+                Ok(())
+            }
+            Err(err) => Err(err),
+        }
+    };
+    if let Err(err) = common_ok {
+        if !(allow_handle_decode_failure
+            && matches!(
+                err.kind,
+                ErrorKind::Format | ErrorKind::Decode | ErrorKind::Io
+            ))
+        {
+            return Err(err);
+        }
+    } else {
+        if let Ok(block_handle) = read_handle_reference(reader, header.handle) {
+            block_header_handle = Some(block_handle);
+        }
+        if has_attribs == 1 {
+            attribute_handles = (|| -> Result<Vec<u64>> {
+                let count = if reader.pre_r2004_layout() {
+                    2
+                } else {
+                    owned_obj_count
+                };
+                let mut handles = Vec::new();
+                for _ in 0..count {
+                    handles.push(read_handle_reference(reader, header.handle)?);
+                }
+                read_handle_reference(reader, header.handle)?; // SEQEND
+                Ok(handles)
+            })()
+            .ok();
+        }
+    }
+
+    Ok(InsertEntity {
+        handle: header.handle,
+        position,
+        scale: (x_scale, y_scale, z_scale),
+        rotation,
+        extrusion,
+        block_header_handle,
+        attribute_handles,
+        owner_handle,
+    })
+}

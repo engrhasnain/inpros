@@ -1,0 +1,1203 @@
+use crate::bit::HandleRef;
+use crate::bit::{BitReader, Endian};
+use crate::core::error::{DwgError, ErrorKind};
+use crate::core::result::Result;
+
+const MAX_COMMON_ENTITY_REACTORS: u32 = 1 << 20;
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CommonEntityColor {
+    pub index: Option<u16>,
+    pub true_color: Option<u32>,
+    pub transparency: Option<u32>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CommonEntityHeader {
+    pub obj_size: u32,
+    pub handle: u64,
+    pub color: CommonEntityColor,
+    pub entity_mode: u8,
+    pub num_of_reactors: u32,
+    pub xdic_missing_flag: u8,
+    pub has_ds_binary_data: bool,
+    pub ltype_flags: u8,
+    pub plotstyle_flags: u8,
+    pub material_flags: u8,
+    pub has_full_visual_style: bool,
+    pub has_face_visual_style: bool,
+    pub has_edge_visual_style: bool,
+    /// R13-R2000 with Nolinks = 0: the handle stream carries the previous and
+    /// next entity handles.
+    pub has_legacy_entity_links: bool,
+    /// R13/R14 store those links after the layer and linetype handles;
+    /// R2000 stores them before the layer handle.
+    pub legacy_links_after_layer: bool,
+    /// Linetype scale of the entity (DXF group 48).
+    pub ltype_scale: f64,
+    /// R2004+: the color refers to a DBCOLOR object (color book color), whose
+    /// handle sits in the handle stream right before the layer handle.
+    pub has_color_handle: bool,
+    /// The entity is not displayed (DXF group 60 = 1).
+    pub invisible: bool,
+    /// Lineweight as stored (R2000+): an index into the lineweight table, with
+    /// 29 = BYLAYER, 30 = BYBLOCK and 31 = the default lineweight. See
+    /// `lineweight_from_index`. `None` before R2000, which has no lineweights.
+    pub line_weight: Option<u8>,
+}
+
+/// R2007+: the string stream of an object, which ends where its handle stream
+/// begins (`data_end_bit`).
+///
+/// Read backwards from there: a `B` flag (the stream is present), the stream
+/// size in bits as `RS` (with bit 15 set, a second `RS` in front of it holds
+/// the high bits) and, in front of the size, the strings in field order.
+///
+/// Returns a reader at the first string and the bit where the strings end, or
+/// `None` when the object has no string stream.
+pub fn string_stream_reader<'a>(
+    reader: &BitReader<'a>,
+    data_end_bit: u32,
+) -> Option<(BitReader<'a>, u32)> {
+    if data_end_bit < 17 || u64::from(data_end_bit) > reader.total_bits() {
+        return None;
+    }
+    let mut flag_reader = reader.clone();
+    flag_reader.set_bit_pos(data_end_bit - 1);
+    if flag_reader.read_b().ok()? == 0 {
+        return None;
+    }
+    let mut size_bit = data_end_bit - 17;
+    let mut size_reader = reader.clone();
+    size_reader.set_bit_pos(size_bit);
+    let mut size = u32::from(size_reader.read_rs(Endian::Little).ok()?);
+    if size & 0x8000 != 0 {
+        size_bit = size_bit.checked_sub(16)?;
+        let mut high_reader = reader.clone();
+        high_reader.set_bit_pos(size_bit);
+        let high = u32::from(high_reader.read_rs(Endian::Little).ok()?);
+        size = (size & 0x7FFF) | (high << 15);
+    }
+    if size == 0 {
+        return None;
+    }
+    let start_bit = size_bit.checked_sub(size)?;
+    let mut strings = reader.clone();
+    strings.set_bit_pos(start_bit);
+    Some((strings, size_bit))
+}
+
+/// The versions that keep the strings of an object in its string stream, as
+/// far as their object layouts differ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StringStreamFormat {
+    /// R2007: the record stores where its handle stream begins.
+    R2007,
+    /// R2010: the object header gives the size of the handle stream.
+    R2010,
+    /// R2013: as R2010; the common entity data carries the data store flag.
+    R2013,
+    /// R2018: as R2013; attributes carry their type (single or multi line).
+    R2018,
+}
+
+/// Common entity data of an entity of R2007 or later.
+///
+/// `object_data_end_bit` is where the handle stream begins; R2007 stores it in
+/// the record, so the argument is not used there. `object_handle` is the handle
+/// of the object index, which R2010+ records are addressed by.
+pub fn parse_common_entity_header_for_format(
+    reader: &mut BitReader<'_>,
+    format: StringStreamFormat,
+    object_data_end_bit: u32,
+    object_handle: u64,
+) -> Result<CommonEntityHeader> {
+    match format {
+        StringStreamFormat::R2007 => parse_common_entity_header_r2007(reader),
+        StringStreamFormat::R2010 => {
+            let mut header = parse_common_entity_header_r2010(reader, object_data_end_bit)?;
+            header.handle = object_handle;
+            Ok(header)
+        }
+        StringStreamFormat::R2013 | StringStreamFormat::R2018 => {
+            let mut header = parse_common_entity_header_r2013(reader, object_data_end_bit)?;
+            header.handle = object_handle;
+            Ok(header)
+        }
+    }
+}
+
+/// The first string of the string stream of an object (see
+/// `string_stream_reader`), or `None` when there is none or it runs past the
+/// stream.
+pub fn first_stream_string(reader: &BitReader<'_>, data_end_bit: u32) -> Option<String> {
+    let (mut strings, strings_end) = string_stream_reader(reader, data_end_bit)?;
+    let text = strings.read_tu().ok()?;
+    (strings.tell_bits() <= u64::from(strings_end)).then_some(text)
+}
+
+/// Lineweights in hundredths of a millimetre, by stored index 0..=23.
+const LINEWEIGHTS: [i16; 24] = [
+    0, 5, 9, 13, 15, 18, 20, 25, 30, 35, 40, 50, 53, 60, 70, 80, 90, 100, 106, 120, 140, 158, 200,
+    211,
+];
+
+/// Lineweight of a stored index as DXF group 370 writes it: hundredths of a
+/// millimetre, -1 = BYLAYER, -2 = BYBLOCK, -3 = the default lineweight.
+/// `None` for an index outside the table.
+///
+/// BYLAYER is index 29. Some writers store 28 instead: the DXF export of such
+/// a drawing has no lineweight on those entities, which is BYLAYER as well.
+pub fn lineweight_from_index(index: u8) -> Option<i16> {
+    match index {
+        28 | 29 => Some(-1),
+        30 => Some(-2),
+        31 => Some(-3),
+        _ => LINEWEIGHTS.get(usize::from(index)).copied(),
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CommonEntityHandles {
+    pub previous: Option<u64>,
+    pub next: Option<u64>,
+    pub owner_ref: Option<u64>,
+    pub reactors: Vec<u64>,
+    pub xdic_obj: Option<u64>,
+    pub layer: u64,
+    pub ltype: Option<u64>,
+    pub plotstyle: Option<u64>,
+    pub material: Option<u64>,
+}
+
+pub fn parse_common_entity_header(reader: &mut BitReader<'_>) -> Result<CommonEntityHeader> {
+    parse_common_entity_header_impl(reader, false, false, false, None)
+}
+
+pub fn parse_common_entity_header_r14(reader: &mut BitReader<'_>) -> Result<CommonEntityHeader> {
+    let start = reader.get_pos();
+    // Spec layout first (ODA "Common Entity Data", R13-R14 columns); the older
+    // guessed layouts stay as fallbacks for files that happened to decode with them.
+    if let Ok(header) = parse_common_entity_header_r13_r14_spec(reader) {
+        return Ok(header);
+    }
+    reader.set_pos(start.0, start.1);
+    match parse_common_entity_header_r14_impl(reader, false) {
+        Ok(header) => Ok(header),
+        Err(err)
+            if matches!(
+                err.kind,
+                crate::core::error::ErrorKind::Format
+                    | crate::core::error::ErrorKind::Decode
+                    | crate::core::error::ErrorKind::Io
+            ) =>
+        {
+            reader.set_pos(start.0, start.1);
+            parse_common_entity_header_r14_impl(reader, true)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// R13/R14 common entity data for the type-specific decoders: the object index
+/// names the handle when the record yields none.
+pub fn parse_common_entity_header_r14_with_handle(
+    reader: &mut BitReader<'_>,
+    object_handle: u64,
+) -> Result<CommonEntityHeader> {
+    let mut header = parse_common_entity_header_r14(reader)?;
+    if header.handle == 0 {
+        header.handle = object_handle;
+    }
+    Ok(header)
+}
+
+pub fn parse_common_entity_header_r2007(reader: &mut BitReader<'_>) -> Result<CommonEntityHeader> {
+    parse_common_entity_header_impl(reader, true, false, false, None)
+}
+
+pub fn parse_common_entity_header_r2010(
+    reader: &mut BitReader<'_>,
+    object_data_end_bit: u32,
+) -> Result<CommonEntityHeader> {
+    parse_common_entity_header_with_byte_align_fallback(
+        reader,
+        true,
+        true,
+        false,
+        Some(object_data_end_bit),
+    )
+}
+
+pub fn parse_common_entity_header_with_proxy_graphics_r2010(
+    reader: &mut BitReader<'_>,
+    object_data_end_bit: u32,
+) -> Result<(CommonEntityHeader, Option<Vec<u8>>)> {
+    parse_common_entity_header_with_proxy_graphics_with_byte_align_fallback(
+        reader,
+        true,
+        true,
+        false,
+        Some(object_data_end_bit),
+    )
+}
+
+pub fn parse_common_entity_header_r2013(
+    reader: &mut BitReader<'_>,
+    object_data_end_bit: u32,
+) -> Result<CommonEntityHeader> {
+    parse_common_entity_header_with_byte_align_fallback(
+        reader,
+        true,
+        true,
+        true,
+        Some(object_data_end_bit),
+    )
+}
+
+pub fn parse_common_entity_header_with_proxy_graphics_r2013(
+    reader: &mut BitReader<'_>,
+    object_data_end_bit: u32,
+) -> Result<(CommonEntityHeader, Option<Vec<u8>>)> {
+    parse_common_entity_header_with_proxy_graphics_with_byte_align_fallback(
+        reader,
+        true,
+        true,
+        true,
+        Some(object_data_end_bit),
+    )
+}
+
+pub fn parse_embedded_common_entity_header_r2010(
+    reader: &mut BitReader<'_>,
+    base_handle: u64,
+    r2013_plus: bool,
+) -> Result<CommonEntityHeader> {
+    parse_common_entity_header_fields_from_entmode(
+        reader,
+        0,
+        base_handle,
+        true,
+        true,
+        r2013_plus,
+        false,
+    )
+}
+
+fn parse_common_entity_header_with_byte_align_fallback(
+    reader: &mut BitReader<'_>,
+    with_material_and_shadow: bool,
+    r2010_plus: bool,
+    r2013_plus: bool,
+    object_data_end_bit: Option<u32>,
+) -> Result<CommonEntityHeader> {
+    let start = reader.get_pos();
+    match parse_common_entity_header_impl(
+        reader,
+        with_material_and_shadow,
+        r2010_plus,
+        r2013_plus,
+        object_data_end_bit,
+    ) {
+        Ok(header) => Ok(header),
+        Err(err)
+            if r2010_plus
+                && matches!(
+                    err.kind,
+                    ErrorKind::Format | ErrorKind::Decode | ErrorKind::Io
+                ) =>
+        {
+            let start_abs_bits = (start.0 as u64)
+                .saturating_mul(8)
+                .saturating_add(start.1 as u64);
+            let mut candidates: Vec<(usize, u8)> = Vec::new();
+            if start.1 != 0 {
+                candidates.push((start.0.saturating_add(1), 0));
+            }
+            for delta_bits in 1..=64u64 {
+                let candidate_abs_bits = start_abs_bits.saturating_add(delta_bits);
+                let Ok(byte_pos) = usize::try_from(candidate_abs_bits / 8) else {
+                    continue;
+                };
+                let bit_pos = (candidate_abs_bits % 8) as u8;
+                let candidate = (byte_pos, bit_pos);
+                if candidate != start && !candidates.contains(&candidate) {
+                    candidates.push(candidate);
+                }
+            }
+            for (byte_pos, bit_pos) in candidates {
+                reader.set_pos(byte_pos, bit_pos);
+                if let Ok(header) = parse_common_entity_header_impl(
+                    reader,
+                    with_material_and_shadow,
+                    r2010_plus,
+                    r2013_plus,
+                    object_data_end_bit,
+                ) {
+                    return Ok(header);
+                }
+            }
+            reader.set_pos(start.0, start.1);
+            Err(err)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn parse_common_entity_header_with_proxy_graphics_with_byte_align_fallback(
+    reader: &mut BitReader<'_>,
+    with_material_and_shadow: bool,
+    r2010_plus: bool,
+    r2013_plus: bool,
+    object_data_end_bit: Option<u32>,
+) -> Result<(CommonEntityHeader, Option<Vec<u8>>)> {
+    let start = reader.get_pos();
+    match parse_common_entity_header_impl_with_proxy_graphics(
+        reader,
+        with_material_and_shadow,
+        r2010_plus,
+        r2013_plus,
+        object_data_end_bit,
+    ) {
+        Ok(decoded) => Ok(decoded),
+        Err(err)
+            if matches!(
+                err.kind,
+                crate::core::error::ErrorKind::Format
+                    | crate::core::error::ErrorKind::Decode
+                    | crate::core::error::ErrorKind::Io
+            ) && start.1 != 0 =>
+        {
+            let mut candidates = vec![(start.0, 0u8)];
+            if start.0 > 0 {
+                candidates.push((start.0 - 1, 0));
+            }
+            for (byte_pos, bit_pos) in candidates {
+                reader.set_pos(byte_pos, bit_pos);
+                if let Ok(decoded) = parse_common_entity_header_impl_with_proxy_graphics(
+                    reader,
+                    with_material_and_shadow,
+                    r2010_plus,
+                    r2013_plus,
+                    object_data_end_bit,
+                ) {
+                    return Ok(decoded);
+                }
+            }
+            reader.set_pos(start.0, start.1);
+            Err(err)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn parse_common_entity_header_impl(
+    reader: &mut BitReader<'_>,
+    with_material_and_shadow: bool,
+    r2010_plus: bool,
+    r2013_plus: bool,
+    object_data_end_bit: Option<u32>,
+) -> Result<CommonEntityHeader> {
+    let (header, _proxy_graphics) = parse_common_entity_header_impl_with_proxy_graphics(
+        reader,
+        with_material_and_shadow,
+        r2010_plus,
+        r2013_plus,
+        object_data_end_bit,
+    )?;
+    Ok(header)
+}
+
+fn parse_common_entity_header_impl_with_proxy_graphics(
+    reader: &mut BitReader<'_>,
+    with_material_and_shadow: bool,
+    r2010_plus: bool,
+    r2013_plus: bool,
+    object_data_end_bit: Option<u32>,
+) -> Result<(CommonEntityHeader, Option<Vec<u8>>)> {
+    let (obj_size, handle, proxy_graphics) =
+        read_common_entity_header_preamble(reader, r2010_plus, object_data_end_bit)?;
+
+    let header = parse_common_entity_header_fields_from_entmode(
+        reader,
+        obj_size,
+        handle,
+        with_material_and_shadow,
+        r2010_plus,
+        r2013_plus,
+        false,
+    )?;
+
+    Ok((header, proxy_graphics))
+}
+
+fn read_common_entity_header_preamble(
+    reader: &mut BitReader<'_>,
+    r2010_plus: bool,
+    object_data_end_bit: Option<u32>,
+) -> Result<(u32, u64, Option<Vec<u8>>)> {
+    let obj_size = match object_data_end_bit {
+        Some(bits) => bits,
+        None => reader.read_rl(Endian::Little)?,
+    };
+    let handle = reader.read_h()?.value;
+
+    let mut ext_size = reader.read_bs()?;
+    if ext_size > 0 {
+        let mut size = ext_size;
+        while size > 0 {
+            let _app_handle = reader.read_h()?;
+            for _ in 0..size {
+                let _ = reader.read_rc()?;
+            }
+            ext_size = reader.read_bs()?;
+            size = ext_size;
+        }
+    }
+
+    let graphic_present_flag = reader.read_b()?;
+    let proxy_graphics = if graphic_present_flag == 1 {
+        let graphic_size = if r2010_plus {
+            reader.read_bll()? as usize
+        } else {
+            reader.read_rl(Endian::Little)? as usize
+        };
+        Some(reader.read_rcs(graphic_size)?.to_vec())
+    } else {
+        None
+    };
+
+    Ok((obj_size, handle, proxy_graphics))
+}
+
+fn parse_common_entity_header_fields_from_entmode(
+    reader: &mut BitReader<'_>,
+    obj_size: u32,
+    handle: u64,
+    with_material_and_shadow: bool,
+    r2010_plus: bool,
+    r2013_plus: bool,
+    has_legacy_entity_links: bool,
+) -> Result<CommonEntityHeader> {
+    let entity_mode = reader.read_bb()?;
+    let num_of_reactors = reader.read_bl()?;
+    if num_of_reactors > MAX_COMMON_ENTITY_REACTORS {
+        return Err(DwgError::new(
+            ErrorKind::Format,
+            format!(
+                "common entity reactor count too large: {num_of_reactors} (max {MAX_COMMON_ENTITY_REACTORS})"
+            ),
+        ));
+    }
+    // R2004+ store "XDic Missing Flag" here. R2000 stores "Nolinks" in the same
+    // place and always has the xdictionary handle; with Nolinks = 0 the handle
+    // stream also carries the previous/next entity handles before the layer.
+    let first_flag = reader.read_b()?;
+    let (xdic_missing_flag, has_legacy_entity_links) = if reader.pre_r2004_layout() {
+        (0, has_legacy_entity_links || first_flag == 0)
+    } else {
+        (first_flag, has_legacy_entity_links)
+    };
+    let has_ds_binary_data = if r2013_plus {
+        reader.read_b()? != 0
+    } else {
+        false
+    };
+
+    let mut color = CommonEntityColor::default();
+    let mut has_color_handle = false;
+    let no_links = reader.read_b()?;
+    if no_links == 0 {
+        let color_mode = reader.read_b()?;
+        if color_mode == 1 {
+            color.index = Some(reader.read_rc()? as u16);
+        } else {
+            let flags = reader.read_rs(Endian::Little)?;
+            color.index = Some(flags & 0x01FF);
+            has_color_handle = flags & 0x4000 != 0 && !reader.pre_r2004_layout();
+            if flags & 0x8000 != 0 && !has_color_handle {
+                // ENC (entity color): the RGB BL is followed by nothing else. Only
+                // the CMC form (used by tables/objects) carries color/book name
+                // strings; reading a TV here misaligned every true-color entity.
+                // A color book color (0x4000) keeps its value in the DBCOLOR object
+                // named in the handle stream and stores no RGB here, even with the
+                // complex color bit set.
+                color.true_color = Some(reader.read_bl()?);
+            }
+            if flags & 0x2000 != 0 {
+                color.transparency = Some(reader.read_bl()?);
+            }
+        }
+    } else {
+        color.index = Some(if reader.read_b()? == 0 { 0 } else { 256 });
+    }
+
+    let ltype_scale = reader.read_bd()?;
+    let ltype_flags = reader.read_bb()?;
+    let plotstyle_flags = reader.read_bb()?;
+    let material_flags = if with_material_and_shadow {
+        let flags = reader.read_bb()?;
+        let _shadow_flags = reader.read_rc()?;
+        flags
+    } else {
+        0
+    };
+    let (has_full_visual_style, has_face_visual_style, has_edge_visual_style) = if r2010_plus {
+        (
+            reader.read_b()? != 0,
+            reader.read_b()? != 0,
+            reader.read_b()? != 0,
+        )
+    } else {
+        (false, false, false)
+    };
+
+    let invisibility = reader.read_bs()?;
+    let line_weight = reader.read_rc()?;
+
+    Ok(CommonEntityHeader {
+        obj_size,
+        handle,
+        color,
+        entity_mode,
+        num_of_reactors,
+        xdic_missing_flag,
+        has_ds_binary_data,
+        ltype_flags,
+        plotstyle_flags,
+        material_flags,
+        has_full_visual_style,
+        has_face_visual_style,
+        has_edge_visual_style,
+        has_legacy_entity_links,
+        legacy_links_after_layer: false,
+        ltype_scale,
+        has_color_handle,
+        invisible: invisibility & 1 != 0,
+        line_weight: Some(line_weight),
+    })
+}
+
+/// R13/R14 common entity data exactly as specified:
+/// `H handle; EED; B picture [RL size, data]; RL bitsize; BB entmode; BL numreactors;
+/// B isbylayerlt; B nolinks; BS color (CMC is an index only before R2004);
+/// BD ltscale; BS invisibility`. There is no xdic-missing flag, no plotstyle/ltype
+/// flag pair and no lineweight byte before R2000.
+fn parse_common_entity_header_r13_r14_spec(
+    reader: &mut BitReader<'_>,
+) -> Result<CommonEntityHeader> {
+    let handle = reader.read_h()?.value;
+    skip_eed(reader)?;
+
+    let graphic_present_flag = reader.read_b()?;
+    if graphic_present_flag == 1 {
+        let graphic_size = reader.read_rl(Endian::Little)? as usize;
+        let _ = reader.read_rcs(graphic_size)?;
+    }
+
+    let obj_size = reader.read_rl(Endian::Little)?;
+    let entity_mode = reader.read_bb()?;
+    let num_of_reactors = reader.read_bl()?;
+    if num_of_reactors > MAX_COMMON_ENTITY_REACTORS {
+        return Err(DwgError::new(
+            ErrorKind::Format,
+            format!(
+                "common entity reactor count too large: {num_of_reactors} (max {MAX_COMMON_ENTITY_REACTORS})"
+            ),
+        ));
+    }
+    let is_bylayer_ltype = reader.read_b()? != 0;
+    let no_links = reader.read_b()?;
+    let color_index = reader.read_bs()?;
+    let ltype_scale = reader.read_bd()?;
+    let invisibility = reader.read_bs()?;
+
+    Ok(CommonEntityHeader {
+        obj_size,
+        handle,
+        color: CommonEntityColor {
+            index: Some(color_index),
+            true_color: None,
+            transparency: None,
+        },
+        entity_mode,
+        num_of_reactors,
+        // R13-R2000 always carry the xdictionary handle.
+        xdic_missing_flag: 0,
+        has_ds_binary_data: false,
+        ltype_flags: if is_bylayer_ltype { 0 } else { 3 },
+        plotstyle_flags: 0,
+        material_flags: 0,
+        has_full_visual_style: false,
+        has_face_visual_style: false,
+        has_edge_visual_style: false,
+        has_legacy_entity_links: no_links == 0,
+        legacy_links_after_layer: true,
+        ltype_scale,
+        has_color_handle: false,
+        invisible: invisibility & 1 != 0,
+        line_weight: None,
+    })
+}
+
+fn parse_common_entity_header_r14_impl(
+    reader: &mut BitReader<'_>,
+    with_ds_binary_flag: bool,
+) -> Result<CommonEntityHeader> {
+    let handle = reader.read_h()?.value;
+    skip_eed(reader)?;
+
+    let graphic_present_flag = reader.read_b()?;
+    if graphic_present_flag == 1 {
+        let graphic_size = reader.read_rl(Endian::Little)? as usize;
+        let _ = reader.read_rcs(graphic_size)?;
+    }
+
+    let obj_size = reader.read_rl(Endian::Little)?;
+    let entity_mode = reader.read_bb()?;
+    let num_of_reactors = reader.read_bl()?;
+    if num_of_reactors > MAX_COMMON_ENTITY_REACTORS {
+        return Err(DwgError::new(
+            ErrorKind::Format,
+            format!(
+                "common entity reactor count too large: {num_of_reactors} (max {MAX_COMMON_ENTITY_REACTORS})"
+            ),
+        ));
+    }
+    let xdic_missing_flag = reader.read_b()?;
+    let has_ds_binary_data = if with_ds_binary_flag {
+        reader.read_b()? != 0
+    } else {
+        false
+    };
+
+    let is_bylayer_ltype = reader.read_b()? != 0;
+    let no_links = reader.read_b()?;
+    let color = read_common_entity_color_cmc(reader)?;
+    let ltype_scale = reader.read_bd()?;
+    let invisibility = reader.read_bs()?;
+    let line_weight = reader.read_rc()?;
+
+    let ltype_flags = if is_bylayer_ltype { 0 } else { 3 };
+
+    Ok(CommonEntityHeader {
+        obj_size,
+        handle,
+        color,
+        entity_mode,
+        num_of_reactors,
+        xdic_missing_flag,
+        has_ds_binary_data,
+        ltype_flags,
+        plotstyle_flags: 0,
+        material_flags: 0,
+        has_full_visual_style: false,
+        has_face_visual_style: false,
+        has_edge_visual_style: false,
+        has_legacy_entity_links: no_links == 0,
+        legacy_links_after_layer: true,
+        ltype_scale,
+        has_color_handle: false,
+        invisible: invisibility & 1 != 0,
+        line_weight: Some(line_weight),
+    })
+}
+
+fn read_common_entity_color_cmc(reader: &mut BitReader<'_>) -> Result<CommonEntityColor> {
+    let color_index = reader.read_bs()?;
+    let color_rgb = reader.read_bl()?;
+    let color_byte = reader.read_rc()?;
+    if (color_byte & 0x01) != 0 {
+        let _color_name = reader.read_tv()?;
+    }
+    if (color_byte & 0x02) != 0 {
+        let _book_name = reader.read_tv()?;
+    }
+
+    let true_color = if color_rgb == 0 || (color_rgb >> 24) == 0 {
+        None
+    } else {
+        let rgb = color_rgb & 0x00FF_FFFF;
+        if rgb == 0 {
+            None
+        } else {
+            Some(rgb)
+        }
+    };
+
+    Ok(CommonEntityColor {
+        index: Some(color_index),
+        true_color,
+        transparency: None,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        checked_handle_count, lineweight_from_index, parse_common_entity_handles,
+        parse_common_entity_header, parse_common_entity_header_r2010,
+        parse_common_entity_header_r2013, string_stream_reader,
+    };
+    use crate::bit::{BitReader, BitWriter, Endian};
+    use crate::core::error::ErrorKind;
+
+    #[test]
+    fn lineweight_index_maps_to_the_dxf_value() {
+        assert_eq!(lineweight_from_index(0), Some(0));
+        assert_eq!(lineweight_from_index(7), Some(25));
+        assert_eq!(lineweight_from_index(23), Some(211));
+        assert_eq!(lineweight_from_index(24), None);
+        assert_eq!(lineweight_from_index(28), Some(-1));
+        assert_eq!(lineweight_from_index(29), Some(-1));
+        assert_eq!(lineweight_from_index(30), Some(-2));
+        assert_eq!(lineweight_from_index(31), Some(-3));
+    }
+
+    #[test]
+    fn string_stream_is_found_from_the_end_of_the_object_data() {
+        // Data bits, the strings, their size in bits and the "present" flag.
+        let mut writer = BitWriter::new();
+        writer.write_rc(0xAB).expect("write data");
+        let strings_start = writer.tell_bits() as u32;
+        writer.write_bs(2).expect("write length");
+        for unit in "OK".encode_utf16() {
+            writer.write_rs(Endian::Little, unit).expect("write unit");
+        }
+        let strings_bits = writer.tell_bits() as u32 - strings_start;
+        writer
+            .write_rs(Endian::Little, strings_bits as u16)
+            .expect("write size");
+        writer.write_b(1).expect("write flag");
+        let data_end = writer.tell_bits() as u32;
+        let bytes = writer.into_bytes();
+
+        let reader = BitReader::new(&bytes);
+        let (mut strings, strings_end) =
+            string_stream_reader(&reader, data_end).expect("string stream");
+        assert_eq!(strings.tell_bits(), u64::from(strings_start));
+        assert_eq!(strings_end, data_end - 17);
+        assert_eq!(strings.read_tu().expect("read string"), "OK");
+        assert_eq!(strings.tell_bits(), u64::from(strings_end));
+
+        // Without the flag there is no string stream.
+        assert!(string_stream_reader(&reader, data_end - 1).is_none());
+    }
+
+    /// Common entity data of a R2000/R2004 entity followed by its handle stream.
+    /// `first_flag` is "Nolinks" in R2000 and "XDic Missing Flag" in R2004.
+    fn build_entity_with_handles(first_flag: u8, color: u16, handles: &[(u8, u64)]) -> Vec<u8> {
+        let mut data = BitWriter::new();
+        data.write_h(0, 0x50).expect("write handle");
+        data.write_bs(0).expect("write ext size");
+        data.write_b(0).expect("write graphic flag");
+        data.write_bb(2).expect("write entity mode"); // model space: no owner handle
+        data.write_bl(0).expect("write reactors");
+        data.write_b(first_flag)
+            .expect("write nolinks / xdic missing");
+        data.write_bs(color).expect("write color");
+        data.write_bd(2.5).expect("write ltype scale");
+        data.write_bb(3).expect("write ltype flags");
+        data.write_bb(0).expect("write plotstyle flags");
+        data.write_bs(0).expect("write invisibility");
+        data.write_rc(0).expect("write line weight");
+
+        let mut handle_stream = BitWriter::new();
+        for (code, value) in handles {
+            handle_stream
+                .write_h(*code, *value)
+                .expect("write handle ref");
+        }
+
+        let obj_size = 32 + data.len_bits();
+        let mut out = BitWriter::new();
+        out.write_rl(Endian::Little, obj_size as u32)
+            .expect("write obj size");
+        out.write_bits_from_bytes(&data.to_bytes(), data.len_bits())
+            .expect("write data");
+        out.write_bits_from_bytes(&handle_stream.to_bytes(), handle_stream.len_bits())
+            .expect("write handles");
+        out.into_bytes()
+    }
+
+    #[test]
+    fn r2000_reads_nolinks_where_r2004_reads_the_xdic_missing_flag() {
+        // Nolinks = 1: xdictionary (null), layer, linetype.
+        let bytes = build_entity_with_handles(1, 7, &[(3, 0), (5, 0x10), (5, 0x16)]);
+        let mut reader = BitReader::new(&bytes);
+        reader.set_pre_r2004_layout(true);
+        let header = parse_common_entity_header(&mut reader).expect("header");
+        assert_eq!(header.xdic_missing_flag, 0);
+        assert!(!header.has_legacy_entity_links);
+        assert_eq!(header.ltype_flags, 3);
+        assert_eq!(header.ltype_scale, 2.5);
+        reader.set_bit_pos(header.obj_size);
+        let handles = parse_common_entity_handles(&mut reader, &header).expect("handles");
+        assert_eq!(handles.xdic_obj, Some(0));
+        assert_eq!(handles.layer, 0x10);
+        assert_eq!(handles.ltype, Some(0x16));
+
+        // Nolinks = 0: the previous and next entity come before the layer.
+        let bytes =
+            build_entity_with_handles(0, 7, &[(3, 0), (8, 0), (6, 0), (5, 0x10), (5, 0x16)]);
+        let mut reader = BitReader::new(&bytes);
+        reader.set_pre_r2004_layout(true);
+        let header = parse_common_entity_header(&mut reader).expect("header");
+        assert_eq!(header.xdic_missing_flag, 0);
+        assert!(header.has_legacy_entity_links);
+        reader.set_bit_pos(header.obj_size);
+        let handles = parse_common_entity_handles(&mut reader, &header).expect("handles");
+        assert_eq!(handles.layer, 0x10);
+        assert_eq!(handles.ltype, Some(0x16));
+
+        // The same bits in a R2004 object: the flag says there is no xdictionary handle.
+        let bytes = build_entity_with_handles(1, 7, &[(5, 0x10), (5, 0x16)]);
+        let mut reader = BitReader::new(&bytes);
+        let header = parse_common_entity_header(&mut reader).expect("header");
+        assert_eq!(header.xdic_missing_flag, 1);
+        assert!(!header.has_legacy_entity_links);
+        reader.set_bit_pos(header.obj_size);
+        let handles = parse_common_entity_handles(&mut reader, &header).expect("handles");
+        assert_eq!(handles.xdic_obj, None);
+        assert_eq!(handles.layer, 0x10);
+        assert_eq!(handles.ltype, Some(0x16));
+    }
+
+    #[test]
+    fn color_book_color_stores_its_handle_before_the_layer_and_no_rgb() {
+        // 0x8000 complex color + 0x4000 color book handle + index 0x2A. No RGB
+        // value follows in the data; the DBCOLOR handle precedes the layer handle.
+        let bytes = build_entity_with_handles(1, 0xC02A, &[(5, 0x996), (5, 0x10), (5, 0x16)]);
+        let mut reader = BitReader::new(&bytes);
+        let header = parse_common_entity_header(&mut reader).expect("header");
+        assert!(header.has_color_handle);
+        assert_eq!(header.color.index, Some(0x2A));
+        assert_eq!(header.color.true_color, None);
+        assert_eq!(header.ltype_scale, 2.5);
+        assert_eq!(header.ltype_flags, 3);
+        reader.set_bit_pos(header.obj_size);
+        let handles = parse_common_entity_handles(&mut reader, &header).expect("handles");
+        assert_eq!(handles.layer, 0x10);
+        assert_eq!(handles.ltype, Some(0x16));
+    }
+
+    #[test]
+    fn checked_handle_count_rejects_counts_the_stream_cannot_hold() {
+        // 4 bytes of handle stream: at most 4 one-byte handle references.
+        let data = [0u8; 4];
+        let reader = BitReader::new(&data);
+        assert_eq!(checked_handle_count(&reader, 0, "owned").unwrap(), 0);
+        assert_eq!(checked_handle_count(&reader, 4, "owned").unwrap(), 4);
+        let err = checked_handle_count(&reader, 5, "owned").unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Format);
+        // A garbage 32-bit count must be rejected instead of reserving gigabytes.
+        let err = checked_handle_count(&reader, u32::MAX as usize, "owned").unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("exceeds the remaining handle stream"));
+    }
+
+    #[test]
+    fn checked_handle_count_accounts_for_consumed_bits() {
+        let data = [0u8; 4];
+        let mut reader = BitReader::new(&data);
+        reader.read_bb().unwrap();
+        reader.read_bb().unwrap();
+        reader.read_bb().unwrap();
+        reader.read_bb().unwrap(); // one byte consumed → 3 bytes left
+        assert!(checked_handle_count(&reader, 3, "owned").is_ok());
+        assert!(checked_handle_count(&reader, 4, "owned").is_err());
+    }
+
+    fn build_minimal_common_header_bytes(r2013_plus: bool) -> Vec<u8> {
+        let mut writer = BitWriter::new();
+        writer.write_h(4, 0).expect("write handle");
+        writer.write_bs(0).expect("write ext size");
+        writer.write_b(0).expect("write graphic flag");
+        writer.write_bb(0).expect("write entity mode");
+        writer.write_bl(0).expect("write reactors");
+        writer.write_b(1).expect("write xdic missing flag");
+        if r2013_plus {
+            writer.write_b(0).expect("write ds binary flag");
+        }
+        writer.write_b(1).expect("write no links");
+        writer.write_b(0).expect("write color unknown");
+        writer.write_bd(1.0).expect("write ltype scale");
+        writer.write_bb(0).expect("write ltype flags");
+        writer.write_bb(0).expect("write plotstyle flags");
+        writer.write_bb(0).expect("write material flags");
+        writer.write_rc(0).expect("write shadow flags");
+        writer.write_b(0).expect("write full visual style flag");
+        writer.write_b(0).expect("write face visual style flag");
+        writer.write_b(0).expect("write edge visual style flag");
+        writer.write_bs(0).expect("write invisibility");
+        writer.write_rc(0).expect("write line weight");
+        writer.into_bytes()
+    }
+
+    fn build_prefixed_r2010_entity_bytes(type_code: u16, r2013_plus: bool) -> Vec<u8> {
+        let mut writer = BitWriter::new();
+        writer.write_umc(0).expect("write handle stream size");
+        writer.write_ot_r2010(type_code).expect("write type code");
+        writer.align_byte();
+        writer
+            .write_rcs(&build_minimal_common_header_bytes(r2013_plus))
+            .expect("write header body");
+        writer.into_bytes()
+    }
+
+    fn build_shifted_r2010_entity_bytes(
+        type_code: u16,
+        r2013_plus: bool,
+        padding_bits: u8,
+    ) -> Vec<u8> {
+        let mut writer = BitWriter::new();
+        writer.write_umc(0).expect("write handle stream size");
+        writer.write_ot_r2010(type_code).expect("write type code");
+        for _ in 0..padding_bits {
+            writer.write_b(0).expect("write padding bit");
+        }
+        writer
+            .write_rcs(&build_minimal_common_header_bytes(r2013_plus))
+            .expect("write shifted header body");
+        writer.into_bytes()
+    }
+
+    #[test]
+    fn parse_common_entity_header_r2010_recovers_from_byte_aligned_body() {
+        let bytes = build_prefixed_r2010_entity_bytes(0x02, false);
+        let mut reader = BitReader::new(&bytes);
+        let _ = reader.read_umc().expect("read handle stream size");
+        let _ = reader.read_ot_r2010().expect("read type code");
+        assert_eq!(reader.get_pos(), (2, 2));
+
+        let header =
+            parse_common_entity_header_r2010(&mut reader, 64).expect("parse common header");
+
+        assert_eq!(header.handle, 0);
+        assert_eq!(header.obj_size, 64);
+        assert!(reader.tell_bits() >= 24);
+    }
+
+    #[test]
+    fn parse_common_entity_header_r2013_recovers_from_byte_aligned_body() {
+        let bytes = build_prefixed_r2010_entity_bytes(0x03, true);
+        let mut reader = BitReader::new(&bytes);
+        let _ = reader.read_umc().expect("read handle stream size");
+        let _ = reader.read_ot_r2010().expect("read type code");
+        assert_eq!(reader.get_pos(), (2, 2));
+
+        let header =
+            parse_common_entity_header_r2013(&mut reader, 72).expect("parse common header");
+
+        assert_eq!(header.handle, 0);
+        assert_eq!(header.obj_size, 72);
+        assert!(!header.has_ds_binary_data);
+        assert!(reader.tell_bits() >= 24);
+    }
+
+    #[test]
+    fn parse_common_entity_header_r2010_recovers_from_shifted_body() {
+        let bytes = build_shifted_r2010_entity_bytes(0x02, false, 3);
+        let mut reader = BitReader::new(&bytes);
+        let _ = reader.read_umc().expect("read handle stream size");
+        let _ = reader.read_ot_r2010().expect("read type code");
+        assert_eq!(reader.get_pos(), (2, 2));
+
+        let header =
+            parse_common_entity_header_r2010(&mut reader, 64).expect("parse common header");
+
+        assert_eq!(header.handle, 0);
+        assert_eq!(header.obj_size, 64);
+        assert!(reader.tell_bits() >= 24);
+    }
+}
+
+fn skip_eed(reader: &mut BitReader<'_>) -> Result<()> {
+    let mut ext_size = reader.read_bs()?;
+    while ext_size > 0 {
+        let _app_handle = reader.read_h()?;
+        for _ in 0..ext_size {
+            let _ = reader.read_rc()?;
+        }
+        ext_size = reader.read_bs()?;
+    }
+    Ok(())
+}
+
+pub fn parse_common_entity_handles(
+    reader: &mut BitReader<'_>,
+    header: &CommonEntityHeader,
+) -> Result<CommonEntityHandles> {
+    let owner_ref = if header.entity_mode == 0 {
+        Some(read_handle_reference(reader, header.handle)?)
+    } else {
+        None
+    };
+
+    let num_of_reactors = checked_handle_count(reader, header.num_of_reactors as usize, "reactor")?;
+    let mut reactors = Vec::with_capacity(num_of_reactors);
+    for _ in 0..num_of_reactors {
+        reactors.push(read_handle_reference(reader, header.handle)?);
+    }
+
+    let xdic_obj = if header.xdic_missing_flag == 0 {
+        Some(read_handle_reference(reader, header.handle)?)
+    } else {
+        None
+    };
+
+    let (mut previous, mut next) = (None, None);
+    let links_before_layer = header.has_legacy_entity_links && !header.legacy_links_after_layer;
+    if links_before_layer {
+        previous = Some(read_handle_reference(reader, header.handle)?);
+        next = Some(read_handle_reference(reader, header.handle)?);
+    }
+
+    if header.has_color_handle {
+        let _color_book_color = read_handle_reference(reader, header.handle)?;
+    }
+
+    let layer = read_handle_reference(reader, header.handle)?;
+
+    let ltype = if header.ltype_flags == 3 {
+        Some(read_handle_reference(reader, header.handle)?)
+    } else {
+        None
+    };
+
+    if header.has_legacy_entity_links && header.legacy_links_after_layer {
+        previous = Some(read_handle_reference(reader, header.handle)?);
+        next = Some(read_handle_reference(reader, header.handle)?);
+    }
+
+    let plotstyle = if header.plotstyle_flags == 3 {
+        Some(read_handle_reference(reader, header.handle)?)
+    } else {
+        None
+    };
+
+    let material = if header.material_flags == 3 {
+        Some(read_handle_reference(reader, header.handle)?)
+    } else {
+        None
+    };
+
+    if header.has_full_visual_style {
+        let _full_visual_style = read_handle_reference(reader, header.handle)?;
+    }
+    if header.has_face_visual_style {
+        let _face_visual_style = read_handle_reference(reader, header.handle)?;
+    }
+    if header.has_edge_visual_style {
+        let _edge_visual_style = read_handle_reference(reader, header.handle)?;
+    }
+
+    Ok(CommonEntityHandles {
+        previous,
+        next,
+        owner_ref,
+        reactors,
+        xdic_obj,
+        layer,
+        ltype,
+        plotstyle,
+        material,
+    })
+}
+
+pub fn parse_common_entity_layer_handle(
+    reader: &mut BitReader<'_>,
+    header: &CommonEntityHeader,
+) -> Result<u64> {
+    if header.entity_mode == 0 {
+        let _owner_ref = read_handle_reference(reader, header.handle)?;
+    }
+
+    for _ in 0..header.num_of_reactors {
+        let _reactor = read_handle_reference(reader, header.handle)?;
+    }
+
+    if header.xdic_missing_flag == 0 {
+        let _xdic_obj = read_handle_reference(reader, header.handle)?;
+    }
+
+    if header.has_legacy_entity_links && !header.legacy_links_after_layer {
+        let _previous = read_handle_reference(reader, header.handle)?;
+        let _next = read_handle_reference(reader, header.handle)?;
+    }
+
+    if header.has_color_handle {
+        let _color_book_color = read_handle_reference(reader, header.handle)?;
+    }
+
+    read_handle_reference(reader, header.handle)
+}
+
+pub fn parse_common_entity_owner_and_layer_handle(
+    reader: &mut BitReader<'_>,
+    header: &CommonEntityHeader,
+    allow_layer_only_fallback: bool,
+) -> Result<(Option<u64>, u64)> {
+    reader.set_bit_pos(header.obj_size);
+    match parse_common_entity_handles(reader, header) {
+        Ok(common_handles) => Ok((common_handles.owner_ref, common_handles.layer)),
+        Err(_err) if allow_layer_only_fallback => {
+            reader.set_bit_pos(header.obj_size);
+            let layer_handle = parse_common_entity_layer_handle(reader, header)?;
+            Ok((None, layer_handle))
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// Validates a handle-reference count that is about to drive a `Vec::with_capacity`.
+///
+/// Every handle reference occupies at least one byte of the handle stream, so a
+/// count larger than the bytes left in the reader cannot be satisfied and must
+/// come from a corrupted or misread field. Rejecting it up front keeps garbage
+/// counts (up to 2^32) from reserving gigabytes and aborting the whole process.
+pub fn checked_handle_count(reader: &BitReader<'_>, count: usize, what: &str) -> Result<usize> {
+    let remaining_bytes = (reader.total_bits().saturating_sub(reader.tell_bits()) / 8) as usize;
+    if count > remaining_bytes {
+        return Err(DwgError::new(
+            ErrorKind::Format,
+            format!(
+                "{what} count {count} exceeds the remaining handle stream ({remaining_bytes} bytes)"
+            ),
+        ));
+    }
+    Ok(count)
+}
+
+pub fn read_handle_reference(reader: &mut BitReader<'_>, base_handle: u64) -> Result<u64> {
+    let HandleRef { code, value, .. } = reader.read_h()?;
+    let absolute = match code {
+        0x06 => base_handle + 1,
+        0x08 => base_handle.saturating_sub(1),
+        0x0A => base_handle.saturating_add(value),
+        0x0C => base_handle.saturating_sub(value),
+        0x02..=0x05 => value,
+        _ => value,
+    };
+    Ok(absolute)
+}
+
+pub fn read_additional_entity_handles(
+    reader: &mut BitReader<'_>,
+    base_handle: u64,
+    max_count: usize,
+) -> Vec<u64> {
+    let mut handles = Vec::new();
+    for _ in 0..max_count {
+        let handle = match read_handle_reference(reader, base_handle) {
+            Ok(value) => value,
+            Err(_) => break,
+        };
+        if handle == 0 || handles.contains(&handle) {
+            continue;
+        }
+        handles.push(handle);
+    }
+    handles
+}

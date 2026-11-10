@@ -1,0 +1,310 @@
+use std::collections::HashMap;
+
+use crate::container::section_directory::{SectionDirectory, SectionKind, SectionLocatorRecord};
+use crate::container::section_loader;
+use crate::core::config::ParseConfig;
+use crate::core::error::{DwgError, ErrorKind};
+use crate::core::result::Result;
+use crate::io::ByteReader;
+use crate::objects::{Handle, ObjectRef};
+
+#[derive(Debug, Clone)]
+pub struct ObjectIndex {
+    pub objects: Vec<ObjectRef>,
+    by_handle: HashMap<Handle, usize>,
+}
+
+impl ObjectIndex {
+    pub fn get(&self, handle: Handle) -> Option<&ObjectRef> {
+        self.by_handle.get(&handle).map(|idx| &self.objects[*idx])
+    }
+
+    pub fn len(&self) -> usize {
+        self.objects.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.objects.is_empty()
+    }
+
+    pub fn from_objects(objects: Vec<ObjectRef>) -> Self {
+        let mut by_handle = HashMap::with_capacity(objects.len());
+        for (idx, obj) in objects.iter().enumerate() {
+            let should_replace = match by_handle.get(&obj.handle).copied() {
+                Some(prev_idx) => {
+                    let prev_offset = objects
+                        .get(prev_idx)
+                        .map(|prev: &ObjectRef| prev.offset)
+                        .unwrap_or(0);
+                    obj.offset > prev_offset
+                }
+                None => true,
+            };
+            if should_replace {
+                by_handle.insert(obj.handle, idx);
+            }
+        }
+        Self { objects, by_handle }
+    }
+}
+
+pub fn build_object_index(bytes: &[u8], config: &ParseConfig) -> Result<ObjectIndex> {
+    let directory = crate::container::section_directory::parse_with_config(bytes, config)?;
+    build_object_index_from_directory(bytes, &directory, config)
+}
+
+pub fn build_object_index_from_directory(
+    bytes: &[u8],
+    directory: &SectionDirectory,
+    config: &ParseConfig,
+) -> Result<ObjectIndex> {
+    let record = find_object_map_record(directory).ok_or_else(|| {
+        DwgError::new(
+            ErrorKind::Format,
+            "object map section not found in section directory",
+        )
+    })?;
+    let section = section_loader::load_section(bytes, record, config)?;
+    parse_object_map(section.data.as_ref(), config)
+}
+
+fn find_object_map_record(directory: &SectionDirectory) -> Option<SectionLocatorRecord> {
+    directory
+        .records
+        .iter()
+        .find(|record| record.kind() == SectionKind::ObjectMap)
+        .cloned()
+}
+
+fn parse_object_map(bytes: &[u8], _config: &ParseConfig) -> Result<ObjectIndex> {
+    let mut reader = ByteReader::new(bytes);
+    let mut objects = Vec::new();
+
+    // Assigned at each Handles-page boundary before first use (absolute first
+    // handleoff/offset). Leave uninitialised so rustc does not warn about a
+    // dead initial write that is always overwritten.
+    let mut last_handle: i64;
+    let mut last_offset: i64;
+    loop {
+        if reader.remaining() < 2 {
+            break;
+        }
+        let section_size = read_u16_be(&mut reader)? as usize;
+        if section_size == 2 {
+            break;
+        }
+        if section_size < 2 {
+            return Err(DwgError::new(
+                ErrorKind::Format,
+                format!("invalid object map block size {section_size}"),
+            ));
+        }
+        if reader.remaining() < section_size - 2 {
+            return Err(DwgError::new(
+                ErrorKind::Format,
+                "object map block exceeds remaining data",
+            )
+            .with_offset(reader.tell()));
+        }
+
+        let start = reader.tell();
+        // Each Handles page encodes the first handleoff as an *absolute*
+        // handle (and the first offset as absolute). LibreDWG seeks by
+        // offset and then reads the body handle; when we materialise the
+        // map itself we must restart the handle accumulator at 0 per page
+        // or page-start absolute handleoffs are added on top of the
+        // previous page's last handle (observed on AC1032 multi-page AC1032 maps: from
+        // object 548 onward every map handle was wrong while offsets
+        // stayed exact).
+        last_handle = 0;
+        last_offset = 0;
+        let _ = _config;
+
+        while (reader.tell() - start) < (section_size as u64 - 2) {
+            let delta_handle = read_unsigned_modular_char(&mut reader)?;
+            let delta_offset = read_modular_char(&mut reader)?;
+            last_handle = last_handle.checked_add(delta_handle).ok_or_else(|| {
+                DwgError::new(ErrorKind::Format, "object map handle overflow")
+                    .with_offset(reader.tell())
+            })?;
+            last_offset = last_offset.checked_add(delta_offset).ok_or_else(|| {
+                DwgError::new(ErrorKind::Format, "object map offset overflow")
+                    .with_offset(reader.tell())
+            })?;
+            if last_handle < 0 || last_offset < 0 {
+                return Err(DwgError::new(
+                    ErrorKind::Format,
+                    "object map contains negative handle/offset",
+                )
+                .with_offset(reader.tell()));
+            }
+            if last_offset > u32::MAX as i64 {
+                return Err(DwgError::new(
+                    ErrorKind::Format,
+                    "object map offset exceeds u32 range",
+                )
+                .with_offset(reader.tell()));
+            }
+            objects.push(ObjectRef {
+                handle: Handle(last_handle as u64),
+                offset: last_offset as u32,
+            });
+        }
+
+        // CRC (big-endian) - currently ignored
+        if reader.remaining() < 2 {
+            break;
+        }
+        let _crc = read_u16_be(&mut reader)?;
+    }
+
+    Ok(ObjectIndex::from_objects(objects))
+}
+
+fn read_u16_be(reader: &mut ByteReader<'_>) -> Result<u16> {
+    let hi = reader.read_u8()? as u16;
+    let lo = reader.read_u8()? as u16;
+    Ok((hi << 8) | lo)
+}
+
+const MAX_UNSIGNED_MODULAR_CHAR_BYTES: usize = 10;
+const MAX_SIGNED_MODULAR_CHAR_BYTES: usize = 9;
+
+/// Object-map handle offsets are unsigned modular chars: the ODA specification
+/// notes that "there is no negation used; handles in the object map are always
+/// in increasing order". Decoding them with the signed reader turned every
+/// terminating byte with bit 0x40 set into a negative delta, which shifted the
+/// handles of all following entries in that section (and dropped entries as
+/// "negative"), so objects were indexed under the wrong handles.
+fn read_unsigned_modular_char(reader: &mut ByteReader<'_>) -> Result<i64> {
+    let mut value: i64 = 0;
+    let mut shift = 0;
+
+    // Handles are up to 8 bytes, i.e. up to 10 modular-char bytes. Drawings
+    // with large handseeds store 6-byte handle deltas; capping at 5 bytes
+    // desynchronised the rest of the map ("block exceeds remaining data").
+    for _ in 0..MAX_UNSIGNED_MODULAR_CHAR_BYTES {
+        let byte = reader.read_u8()?;
+        value |= ((byte & 0x7F) as i64) << shift;
+        if (byte & 0x80) == 0 {
+            return Ok(value);
+        }
+        shift += 7;
+    }
+    Err(DwgError::new(ErrorKind::Format, "unsigned modular char too long").with_offset(reader.tell()))
+}
+
+fn read_modular_char(reader: &mut ByteReader<'_>) -> Result<i64> {
+    let mut value: i64 = 0;
+    let mut shift = 0;
+
+    for _ in 0..MAX_SIGNED_MODULAR_CHAR_BYTES {
+        let mut byte = reader.read_u8()?;
+        if (byte & 0x80) == 0 {
+            let negative = (byte & 0x40) != 0;
+            if negative {
+                byte &= 0xBF;
+            }
+            value |= (byte as i64) << shift;
+            if negative {
+                value = -value;
+            }
+            return Ok(value);
+        }
+        byte &= 0x7F;
+        value |= (byte as i64) << shift;
+        shift += 7;
+    }
+    Err(DwgError::new(ErrorKind::Format, "signed modular char too long").with_offset(reader.tell()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_object_map, ObjectIndex};
+    use crate::core::config::ParseConfig;
+    use crate::objects::{Handle, ObjectRef};
+
+    #[test]
+    fn object_index_prefers_highest_offset_for_duplicate_handles() {
+        let index = ObjectIndex::from_objects(vec![
+            ObjectRef {
+                handle: Handle(237),
+                offset: 527_255,
+            },
+            ObjectRef {
+                handle: Handle(237),
+                offset: 12_157,
+            },
+            ObjectRef {
+                handle: Handle(237),
+                offset: 204_892,
+            },
+        ]);
+
+        let resolved = index.get(Handle(237)).expect("duplicate-handle entry");
+        assert_eq!(resolved.offset, 527_255);
+    }
+
+    #[test]
+    fn parse_multiblock_object_map_handle_and_offset_reset_per_block() {
+        // Each Handles page (≈2032 bytes) encodes the first handleoff as an
+        // absolute handle and the first offset as absolute. Within a page,
+        // both accumulate as signed/unsigned modular-char deltas. Verified
+        // against LibreDWG -v5 dumps of AC1032 multi-page AC1032 maps: continuing the handle
+        // accumulator across pages doubled absolute page-start handleoffs
+        // onto the previous page's last handle (object 548+).
+        let bytes = vec![
+            0x00, 0x06, // block 1: 2-byte header + 4-byte payload
+            0x01, 0x0A, // +1, +10
+            0x02, 0x04, // +2, +4
+            0x00, 0x00, // crc
+            0x00, 0x06, // block 2: handle + offset both restart at 0
+            0x07, 0x08, // abs 7, +8
+            0x02, 0x03, // +2, +3
+            0x00, 0x00, // crc
+            0x00, 0x02, // terminator block
+        ];
+        let config = ParseConfig::default();
+        let index = parse_object_map(&bytes, &config).expect("index");
+        let refs: Vec<(u64, u32)> = index
+            .objects
+            .iter()
+            .map(|obj| (obj.handle.0, obj.offset))
+            .collect();
+        // handle: 1, 3, then reset -> 7, 9
+        // offset: 10, 14, then reset -> 8, 11
+        assert_eq!(refs, vec![(1, 10), (3, 14), (7, 8), (9, 11)]);
+    }
+
+    #[test]
+    fn parse_object_map_accepts_six_byte_handle_delta() {
+        // Byte pattern from production AC1015 drawings: a handle delta that
+        // needs 6 modular-char bytes (0x1DC3808BF1). A 5-byte cap stopped
+        // mid-value and every following entry was decoded out of sync.
+        let bytes = vec![
+            0x00, 0x0D, // block: 2-byte header + 11-byte payload
+            0x01, 0x0A, // +1, +10
+            0xF1, 0x97, 0x82, 0x9C, 0xDC, 0x03, 0x04, // +0x1DC3808BF1, +4
+            0x01, 0x01, // +1, +1
+            0x00, 0x00, // crc
+            0x00, 0x02, // terminator block
+        ];
+        let index = parse_object_map(&bytes, &ParseConfig::default()).expect("index");
+        let refs: Vec<(u64, u32)> = index
+            .objects
+            .iter()
+            .map(|obj| (obj.handle.0, obj.offset))
+            .collect();
+        let big = 1 + 0x1D_C380_8BF1_u64;
+        assert_eq!(refs, vec![(1, 10), (big, 14), (big + 1, 15)]);
+    }
+
+    #[test]
+    fn parse_object_map_rejects_unterminated_modular_char() {
+        let mut bytes = vec![0x00, 0x0E];
+        bytes.extend_from_slice(&[0xFF; 11]); // never-ending modular char
+        bytes.extend_from_slice(&[0x01, 0x00, 0x00, 0x00, 0x02]);
+        let err = parse_object_map(&bytes, &ParseConfig::default()).unwrap_err();
+        assert!(err.to_string().contains("modular char too long"), "{err}");
+    }
+}

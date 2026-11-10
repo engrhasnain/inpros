@@ -1,0 +1,37 @@
+# ezdwg
+
+[![PyPI version](https://badge.fury.io/py/ezdwg.svg)](https://badge.fury.io/py/ezdwg)
+[![GitHub](https://img.shields.io/github/license/monozukuri-ai/ezdwg)](https://github.com/monozukuri-ai/ezdwg)
+
+**DWG (R13–R2018 / AC1012–AC1032) reader with a Python API inspired by ezdxf.**
+
+ezdwg is a read-focused DWG parser with a Rust core exposed to Python via PyO3. It provides a simple, friendly API for extracting geometry, text, dimensions, and other entities from DWG files, and includes a native AC1015 writer for basic entities.
+
+## Key Features
+
+- **DWG parsing** — R13 (AC1012) through R2018 (AC1032)
+- **High-performance Rust core** — fast binary parsing via PyO3
+- **ezdxf-inspired API** — familiar `Document` / `Layout` / `Entity` pattern
+- **Plotting support** — render DWG files with matplotlib
+- **DXF export** — convert DWG to DXF using ezdxf as backend
+- **Native DWG write (AC1015)** — write `LINE/RAY/XLINE/POINT/ARC/CIRCLE/LWPOLYLINE/TEXT/MTEXT`
+- **CLI tools** — inspect, convert, and write DWG files from the command line
+
+## Quick Example
+
+```python
+import ezdwg
+
+doc = ezdwg.read("drawing.dwg")
+msp = doc.modelspace()
+
+for entity in msp.query("LINE ARC CIRCLE"):
+    print(entity.dxftype, entity.handle, entity.dxf)
+```
+
+## Next Steps
+
+- [Installation](getting-started/installation.md) — get ezdwg up and running
+- [Quick Start](getting-started/quickstart.md) — learn the basics in 5 minutes
+- [User Guide](guide/reading-files.md) — detailed usage guides
+- [API Reference](api/index.md) — full API documentation

@@ -1,0 +1,701 @@
+use crate::core::error::{DwgError, ErrorKind};
+use crate::core::result::Result;
+use encoding_rs::Encoding;
+
+#[derive(Debug, Clone, Copy)]
+pub enum Endian {
+    Little,
+    Big,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HandleRef {
+    pub code: u8,
+    pub counter: u8,
+    pub value: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct BitReader<'a> {
+    data: &'a [u8],
+    byte_pos: usize,
+    bit_pos: u8,
+    codepage: Option<u16>,
+    pre_r2004_layout: bool,
+}
+
+impl<'a> BitReader<'a> {
+    const MAX_TEXT_UNITS: usize = 1 << 20; // 1,048,576 chars
+
+    pub fn new(data: &'a [u8]) -> Self {
+        Self::new_with_codepage(data, None)
+    }
+
+    pub fn new_with_codepage(data: &'a [u8], codepage: Option<u16>) -> Self {
+        Self {
+            data,
+            byte_pos: 0,
+            bit_pos: 0,
+            codepage,
+            pre_r2004_layout: false,
+        }
+    }
+
+    /// Marks the data as an R2000 (AC1015) object.
+    ///
+    /// R2000 and R2004 share their object decoders, but one flag bit of the common
+    /// object data means something else: R2004+ stores "XDic Missing Flag" where
+    /// R2000 stores "Nolinks" (and always has the xdictionary handle). The decoders
+    /// ask the reader which of the two they are looking at.
+    pub fn set_pre_r2004_layout(&mut self, value: bool) {
+        self.pre_r2004_layout = value;
+    }
+
+    pub fn pre_r2004_layout(&self) -> bool {
+        self.pre_r2004_layout
+    }
+
+    pub fn tell_bits(&self) -> u64 {
+        (self.byte_pos as u64) * 8 + self.bit_pos as u64
+    }
+
+    pub fn total_bits(&self) -> u64 {
+        (self.data.len() as u64) * 8
+    }
+
+    pub fn get_pos(&self) -> (usize, u8) {
+        (self.byte_pos, self.bit_pos)
+    }
+
+    pub fn set_pos(&mut self, byte_pos: usize, bit_pos: u8) {
+        self.byte_pos = byte_pos;
+        self.bit_pos = bit_pos.min(7);
+    }
+
+    pub fn set_bit_pos(&mut self, bit_pos: u32) {
+        let (byte_pos, bit_pos) = (bit_pos / 8, bit_pos % 8);
+        self.set_pos(byte_pos as usize, bit_pos as u8);
+    }
+
+    pub fn align_byte(&mut self) {
+        if self.bit_pos != 0 {
+            self.bit_pos = 0;
+            self.byte_pos += 1;
+        }
+    }
+
+    pub fn read_b(&mut self) -> Result<u8> {
+        if self.byte_pos >= self.data.len() {
+            return Err(
+                DwgError::new(ErrorKind::Io, "unexpected EOF").with_offset(self.byte_pos as u64)
+            );
+        }
+        let byte = self.data[self.byte_pos];
+        let bit = (byte & (0x80 >> self.bit_pos)) >> (7 - self.bit_pos);
+        self.advance(1);
+        Ok(bit)
+    }
+
+    pub fn read_bb(&mut self) -> Result<u8> {
+        Ok(self.read_bits_msb(2)? as u8)
+    }
+
+    pub fn read_3b(&mut self) -> Result<u8> {
+        Ok(self.read_bits_msb(3)? as u8)
+    }
+
+    pub fn read_bits_msb(&mut self, n: u8) -> Result<u64> {
+        if n > 64 {
+            return Err(DwgError::new(
+                ErrorKind::Decode,
+                format!("read_bits supports up to 64 bits, got {n}"),
+            ));
+        }
+        let mut value = 0u64;
+        for _ in 0..n {
+            value = (value << 1) | (self.read_b()? as u64);
+        }
+        Ok(value)
+    }
+
+    pub fn read_rc(&mut self) -> Result<u8> {
+        if self.byte_pos >= self.data.len() {
+            return Err(
+                DwgError::new(ErrorKind::Io, "unexpected EOF").with_offset(self.byte_pos as u64)
+            );
+        }
+
+        let mut value = self.data[self.byte_pos] as u16;
+        if self.bit_pos != 0 {
+            value <<= self.bit_pos;
+            if self.byte_pos + 1 < self.data.len() {
+                value |= (self.data[self.byte_pos + 1] as u16) >> (8 - self.bit_pos);
+            }
+        }
+        self.advance(8);
+        Ok((value & 0xFF) as u8)
+    }
+
+    pub fn read_rcs(&mut self, count: usize) -> Result<Vec<u8>> {
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        let remaining = self.data.len().saturating_sub(self.byte_pos);
+        if count > remaining {
+            return Err(DwgError::new(
+                ErrorKind::Format,
+                format!(
+                    "raw byte length {count} exceeds remaining bytes {remaining} at bit offset {}",
+                    self.tell_bits()
+                ),
+            )
+            .with_offset(self.byte_pos as u64));
+        }
+        if self.bit_pos == 0 {
+            let start = self.byte_pos;
+            let end = start + count;
+            self.byte_pos = end;
+            return Ok(self.data[start..end].to_vec());
+        }
+
+        let mut out = Vec::with_capacity(count);
+        for _ in 0..count {
+            out.push(self.read_rc()?);
+        }
+        Ok(out)
+    }
+
+    pub fn read_rs(&mut self, endian: Endian) -> Result<u16> {
+        let byte1 = self.read_rc()? as u16;
+        let byte2 = self.read_rc()? as u16;
+        let value = match endian {
+            Endian::Little => (byte2 << 8) | byte1,
+            Endian::Big => (byte1 << 8) | byte2,
+        };
+        Ok(value)
+    }
+
+    pub fn read_rl(&mut self, endian: Endian) -> Result<u32> {
+        let short1 = self.read_rs(endian)? as u32;
+        let short2 = self.read_rs(endian)? as u32;
+        let value = match endian {
+            Endian::Little => (short2 << 16) | short1,
+            Endian::Big => (short1 << 16) | short2,
+        };
+        Ok(value)
+    }
+
+    pub fn read_rd(&mut self, endian: Endian) -> Result<f64> {
+        let mut data = [0u8; 8];
+        for byte in &mut data {
+            *byte = self.read_rc()?;
+        }
+        let value = match endian {
+            Endian::Little => f64::from_le_bytes(data),
+            Endian::Big => f64::from_be_bytes(data),
+        };
+        Ok(value)
+    }
+
+    pub fn read_bd(&mut self) -> Result<f64> {
+        let what_it_is = self.read_bb()?;
+        let value = match what_it_is {
+            0x00 => self.read_rd(Endian::Little)?,
+            0x01 => 1.0,
+            0x02 => 0.0,
+            0x03 => 0.0,
+            _ => 0.0,
+        };
+        Ok(value)
+    }
+
+    pub fn read_3bd(&mut self) -> Result<(f64, f64, f64)> {
+        Ok((self.read_bd()?, self.read_bd()?, self.read_bd()?))
+    }
+
+    pub fn read_dd(&mut self, default_value: f64) -> Result<f64> {
+        let what_it_is = self.read_bb()?;
+        let value = match what_it_is {
+            0 => default_value,
+            1 => {
+                let mut data = default_value.to_le_bytes();
+                data[0] = self.read_rc()?;
+                data[1] = self.read_rc()?;
+                data[2] = self.read_rc()?;
+                data[3] = self.read_rc()?;
+                f64::from_le_bytes(data)
+            }
+            2 => {
+                let mut data = default_value.to_le_bytes();
+                data[4] = self.read_rc()?;
+                data[5] = self.read_rc()?;
+                data[0] = self.read_rc()?;
+                data[1] = self.read_rc()?;
+                data[2] = self.read_rc()?;
+                data[3] = self.read_rc()?;
+                f64::from_le_bytes(data)
+            }
+            3 => self.read_rd(Endian::Little)?,
+            _ => default_value,
+        };
+        Ok(value)
+    }
+
+    pub fn read_bt(&mut self) -> Result<f64> {
+        let what_it_is = self.read_b()?;
+        if what_it_is == 1 {
+            Ok(0.0)
+        } else {
+            self.read_bd()
+        }
+    }
+
+    pub fn read_be(&mut self) -> Result<(f64, f64, f64)> {
+        let what_it_is = self.read_b()?;
+        if what_it_is == 1 {
+            Ok((0.0, 0.0, 1.0))
+        } else {
+            Ok((self.read_bd()?, self.read_bd()?, self.read_bd()?))
+        }
+    }
+
+    pub fn read_bs(&mut self) -> Result<u16> {
+        let what_it_is = self.read_bb()?;
+        let value = match what_it_is {
+            0x00 => self.read_rs(Endian::Little)?,
+            0x01 => self.read_rc()? as u16,
+            0x02 => 0,
+            0x03 => 256,
+            _ => 0,
+        };
+        Ok(value)
+    }
+
+    pub fn read_bl(&mut self) -> Result<u32> {
+        let what_it_is = self.read_bb()?;
+        let value = match what_it_is {
+            0x00 => self.read_rl(Endian::Little)?,
+            0x01 => self.read_rc()? as u32,
+            0x02 => 0,
+            0x03 => 0,
+            _ => 0,
+        };
+        Ok(value)
+    }
+
+    /// BLL (R2010+): a 3-bit byte count, then that many bytes, least
+    /// significant byte first.
+    pub fn read_bll(&mut self) -> Result<u64> {
+        let length = self.read_3b()? as usize;
+        let mut value = 0u64;
+        for index in 0..length {
+            value |= (self.read_rc()? as u64) << (8 * index);
+        }
+        Ok(value)
+    }
+
+    pub fn read_ms(&mut self) -> Result<u32> {
+        let mut value: u32 = 0;
+        let mut shift = 0;
+
+        for _ in 0..2 {
+            let mut word = self.read_rs(Endian::Little)?;
+            if (word & 0x8000) == 0 {
+                value |= (word as u32) << shift;
+                return Ok(value);
+            }
+            word &= 0x7FFF;
+            value |= (word as u32) << shift;
+            shift += 15;
+        }
+
+        Ok(value)
+    }
+
+    pub fn read_mc(&mut self) -> Result<i64> {
+        let mut value: i64 = 0;
+        let mut shift = 0;
+
+        for _ in 0..4 {
+            let mut byte = self.read_rc()?;
+            if (byte & 0x80) == 0 {
+                let negative = (byte & 0x40) != 0;
+                if negative {
+                    byte &= 0xBF;
+                }
+                value |= (byte as i64) << shift;
+                if negative {
+                    value = -value;
+                }
+                return Ok(value);
+            }
+            byte &= 0x7F;
+            value |= (byte as i64) << shift;
+            shift += 7;
+        }
+
+        Ok(value)
+    }
+
+    pub fn read_umc(&mut self) -> Result<u32> {
+        let mut value: u32 = 0;
+        let mut shift = 0u32;
+
+        for _ in 0..5 {
+            let byte = self.read_rc()?;
+            let chunk = (byte & 0x7F) as u32;
+            value |= chunk << shift;
+            if (byte & 0x80) == 0 {
+                return Ok(value);
+            }
+            shift += 7;
+        }
+
+        Ok(value)
+    }
+
+    pub fn read_ot_r2010(&mut self) -> Result<u16> {
+        let opcode = self.read_bb()?;
+        let type_code = match opcode {
+            0 => self.read_rc()? as u16,
+            1 => self.read_rc()? as u16 + 0x01F0,
+            2 | 3 => self.read_rs(Endian::Little)?,
+            _ => 0,
+        };
+        Ok(type_code)
+    }
+
+    pub fn read_h(&mut self) -> Result<HandleRef> {
+        let mut code = self.read_rc()?;
+        let counter = code & 0x0F;
+        code = (code & 0xF0) >> 4;
+        // DWG handle payload is 0..=8 bytes (LibreDWG / ODA). Older ezdwg
+        // capped at 4, which rejects valid absolute refs on large-handle
+        // drawings (observed: "invalid handle counter 8" on AC1032 DICTIONARY).
+        if counter > 8 {
+            return Err(DwgError::new(
+                ErrorKind::Format,
+                format!("invalid handle counter {counter}"),
+            )
+            .with_offset(self.byte_pos as u64));
+        }
+        let mut value: u64 = 0;
+        if counter > 0 {
+            for idx in (0..counter).rev() {
+                let byte = self.read_rc()? as u64;
+                value |= byte << (idx * 8);
+            }
+        }
+        Ok(HandleRef {
+            code,
+            counter,
+            value,
+        })
+    }
+
+    pub fn read_tv(&mut self) -> Result<String> {
+        let length = self.read_bs()? as usize;
+        if length > Self::MAX_TEXT_UNITS {
+            return Err(DwgError::new(
+                ErrorKind::Format,
+                format!("text length too large for TV string: {length}"),
+            )
+            .with_offset(self.byte_pos as u64));
+        }
+        let remaining_bytes = self.data.len().saturating_sub(self.byte_pos);
+        if length > remaining_bytes {
+            return Err(DwgError::new(
+                ErrorKind::Format,
+                format!("TV string length {length} exceeds remaining bytes {remaining_bytes}"),
+            )
+            .with_offset(self.byte_pos as u64));
+        }
+        let mut text = Vec::with_capacity(length);
+        for _ in 0..length {
+            let ch = self.read_rc()?;
+            if ch == 0x00 {
+                continue;
+            }
+            text.push(ch);
+        }
+        Ok(decode_tv_bytes(&text, self.codepage))
+    }
+
+    pub fn read_tu(&mut self) -> Result<String> {
+        let length = self.read_bs()? as usize;
+        if length > Self::MAX_TEXT_UNITS {
+            return Err(DwgError::new(
+                ErrorKind::Format,
+                format!("text length too large for TU string: {length}"),
+            )
+            .with_offset(self.byte_pos as u64));
+        }
+        let remaining_bytes = self.data.len().saturating_sub(self.byte_pos);
+        let required_bytes = length.saturating_mul(2);
+        if required_bytes > remaining_bytes {
+            return Err(
+                DwgError::new(
+                    ErrorKind::Format,
+                    format!(
+                        "TU string length {length} requires {required_bytes} bytes, but {remaining_bytes} remain"
+                    ),
+                )
+                .with_offset(self.byte_pos as u64),
+            );
+        }
+        let mut units = Vec::with_capacity(length);
+        for _ in 0..length {
+            units.push(self.read_rs(Endian::Little)?);
+        }
+        Ok(String::from_utf16_lossy(&units))
+    }
+
+    pub fn read_crc(&mut self) -> Result<u16> {
+        if self.bit_pos > 0 {
+            self.set_pos(self.byte_pos + 1, 0);
+        }
+        self.read_rs(Endian::Little)
+    }
+
+    fn advance(&mut self, bits: u8) {
+        let pos_end = self.bit_pos as u16 + bits as u16;
+        self.byte_pos += (pos_end / 8) as usize;
+        self.bit_pos = (pos_end % 8) as u8;
+    }
+}
+
+pub fn decode_tv_bytes(bytes: &[u8], codepage: Option<u16>) -> String {
+    if bytes.is_empty() {
+        return String::new();
+    }
+
+    if matches!(codepage, Some(0) | Some(1)) {
+        return bytes
+            .iter()
+            .copied()
+            .filter(|byte| *byte != 0)
+            .map(char::from)
+            .collect();
+    }
+
+    if let Some(encoding) = dwg_codepage_encoding(codepage) {
+        // No BOM sniffing: cp1252 text may start with "ÿþ" (FF FE) or "ï»¿" (EF BB BF),
+        // which `Encoding::decode` would otherwise read as UTF-16LE / UTF-8.
+        let (decoded, _) = encoding.decode_without_bom_handling(bytes);
+        return decode_legacy_text_escapes(&decoded);
+    }
+
+    String::from_utf8_lossy(bytes).to_string()
+}
+
+/// AutoCAD legacy Unicode/MIF escapes, also emitted by ODA when saving names
+/// and MTEXT. Invalid sequences and escaped literal backslashes stay untouched.
+fn decode_legacy_text_escapes(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut tail = text;
+    while !tail.is_empty() {
+        let b = tail.as_bytes();
+        if tail.starts_with("\\\\") {
+            out.push_str("\\\\");
+            tail = &tail[2..];
+            continue;
+        }
+        if b.len() >= 7 && b.starts_with(b"\\U+") && b[3..7].iter().all(u8::is_ascii_hexdigit) {
+            let mut value = u32::from_str_radix(&tail[3..7], 16).unwrap();
+            let mut n = 7;
+            if (0xD800..=0xDBFF).contains(&value)
+                && b.len() >= 14
+                && b[7..].starts_with(b"\\U+")
+                && b[10..14].iter().all(u8::is_ascii_hexdigit)
+            {
+                let low = u32::from_str_radix(&tail[10..14], 16).unwrap();
+                if (0xDC00..=0xDFFF).contains(&low) {
+                    value = 0x10000 + ((value - 0xD800) << 10) + low - 0xDC00;
+                    n = 14;
+                }
+            }
+            if let Some(c) = char::from_u32(value) {
+                out.push(c);
+                tail = &tail[n..];
+                continue;
+            }
+        }
+        if b.len() >= 8 && b.starts_with(b"\\M+") && b[4..8].iter().all(u8::is_ascii_hexdigit) {
+            let cp = match b[3] {
+                b'1' => 38,
+                b'2' => 41,
+                b'3' => 40,
+                b'5' => 39,
+                _ => 0,
+            };
+            if let Some(encoding) = dwg_codepage_encoding(Some(cp)) {
+                let value = u16::from_str_radix(&tail[4..8], 16).unwrap().to_be_bytes();
+                let (decoded, errors) = encoding.decode_without_bom_handling(&value);
+                if !errors {
+                    out.push_str(&decoded);
+                    tail = &tail[8..];
+                    continue;
+                }
+            }
+        }
+        let c = tail.chars().next().unwrap();
+        out.push(c);
+        tail = &tail[c.len_utf8()..];
+    }
+    out
+}
+
+pub(crate) fn dwg_codepage_encoding(codepage: Option<u16>) -> Option<&'static Encoding> {
+    let label: &'static [u8] = match codepage? {
+        2 => b"windows-1252",
+        3 => b"iso-8859-2",
+        5 => b"iso-8859-4",
+        6 => b"iso-8859-5",
+        7 => b"iso-8859-6",
+        8 => b"iso-8859-7",
+        9 => b"iso-8859-8",
+        10 => b"iso-8859-9",
+        11 => b"windows-1252",
+        12 => b"windows-1252",
+        13 => b"windows-1250",
+        14 => b"windows-1251",
+        15 => b"windows-1254",
+        19 => b"windows-1256",
+        21 => b"windows-1253",
+        22 | 38 => b"shift_jis",
+        23 => b"macintosh",
+        24 | 41 => b"big5",
+        25 | 40 => b"euc-kr",
+        27 => b"ibm866",
+        28 => b"windows-1250",
+        29 => b"windows-1251",
+        30 => b"windows-1252",
+        31 | 39 => b"gbk",
+        32 => b"windows-1253",
+        33 => b"windows-1254",
+        34 => b"windows-1255",
+        35 => b"windows-1256",
+        36 => b"windows-1257",
+        37 => b"windows-874",
+        _ => return None,
+    };
+    Encoding::for_label(label)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BitReader, Endian};
+    use crate::bit::BitWriter;
+
+    #[test]
+    fn legacy_text_escapes_survive_external_resave() {
+        use super::decode_tv_bytes;
+        assert_eq!(
+            decode_tv_bytes(br"\M+193FA\M+1967B\M+18CEA", Some(30)),
+            "日本語"
+        );
+        assert_eq!(
+            decode_tv_bytes(br"\U+65E5\U+672C\U+8A9E", Some(30)),
+            "日本語"
+        );
+        assert_eq!(decode_tv_bytes(br"\\M+193FA", Some(30)), r"\\M+193FA");
+        assert_eq!(decode_tv_bytes(br"\M+1ZZZZ", Some(30)), r"\M+1ZZZZ");
+    }
+
+    #[test]
+    fn read_tu_decodes_utf16_string() {
+        let mut writer = BitWriter::new();
+        writer.write_bs(4).expect("write len");
+        writer
+            .write_rs(Endian::Little, 'テ' as u16)
+            .expect("write char");
+        writer
+            .write_rs(Endian::Little, 'ス' as u16)
+            .expect("write char");
+        writer
+            .write_rs(Endian::Little, 'ト' as u16)
+            .expect("write char");
+        writer
+            .write_rs(Endian::Little, 'A' as u16)
+            .expect("write char");
+
+        let bytes = writer.into_bytes();
+        let mut reader = BitReader::new(&bytes);
+        assert_eq!(reader.read_tu().expect("read tu"), "テストA");
+    }
+
+    #[test]
+    fn read_bll_takes_the_least_significant_byte_first() {
+        // Byte count 2 (bits 010), then 0xCC 0x04: the size 1228 of a graphic
+        // image, as R2010+ files store it.
+        let bytes = [0b0101_1001, 0b1000_0000, 0b1000_0000];
+        let mut reader = BitReader::new(&bytes);
+        assert_eq!(reader.read_bll().expect("read bll"), 0x04CC);
+    }
+
+    #[test]
+    fn read_tv_rejects_length_exceeding_remaining_bytes() {
+        let mut writer = BitWriter::new();
+        writer.write_bs(4).expect("write len");
+        writer.write_rc(0x41).expect("write char");
+        writer.write_rc(0x42).expect("write char");
+
+        let bytes = writer.into_bytes();
+        let mut reader = BitReader::new(&bytes);
+        let err = reader.read_tv().expect_err("expected TV length overflow");
+        assert!(format!("{err}").contains("exceeds remaining bytes"));
+    }
+
+    #[test]
+    fn read_tu_rejects_length_exceeding_remaining_bytes() {
+        let mut writer = BitWriter::new();
+        writer.write_bs(3).expect("write len");
+        writer
+            .write_rs(Endian::Little, 'A' as u16)
+            .expect("write char");
+
+        let bytes = writer.into_bytes();
+        let mut reader = BitReader::new(&bytes);
+        let err = reader.read_tu().expect_err("expected TU length overflow");
+        assert!(format!("{err}").contains("requires"));
+    }
+
+    #[test]
+    fn read_tu_rejects_large_length_when_data_is_short() {
+        let mut writer = BitWriter::new();
+        writer.write_bs(65535).expect("write len");
+        writer
+            .write_rs(Endian::Little, 'A' as u16)
+            .expect("write char");
+
+        let bytes = writer.into_bytes();
+        let mut reader = BitReader::new(&bytes);
+        let err = reader
+            .read_tu()
+            .expect_err("expected TU length/remaining-bytes error");
+        assert!(format!("{err}").contains("requires"));
+    }
+
+    #[test]
+    fn read_rcs_rejects_overflow_when_unaligned() {
+        let data = [0xAA, 0xBB];
+        let mut reader = BitReader::new(&data);
+        let _ = reader.read_b().expect("consume one bit");
+        let err = reader.read_rcs(3).expect_err("expected raw-byte overflow");
+        assert!(format!("{err}").contains("exceeds remaining bytes"));
+    }
+
+    #[test]
+    fn read_tv_decodes_ansi_932_text() {
+        let bytes = [0x8E, 0xB7, 0x96, 0xB1, 0x8E, 0xBA, 0x31, 0x32, 0x6C, 0x31];
+        let mut writer = BitWriter::new();
+        writer.write_bs(bytes.len() as u16).expect("write tv len");
+        for byte in bytes {
+            writer.write_rc(byte).expect("write tv byte");
+        }
+
+        let data = writer.into_bytes();
+        let mut reader = BitReader::new_with_codepage(&data, Some(38));
+        assert_eq!(reader.read_tv().expect("read tv"), "執務室12l1");
+    }
+}

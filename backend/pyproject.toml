@@ -1,0 +1,27 @@
+[project]
+name = "backend"
+version = "0.1.0"
+description = "INPROS estimations API: drawing takeoff, contract catalog, estimación check, reports, bids"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "ezdwg",
+    "ezdxf>=1.4.5",
+    "fastapi>=0.162.0",
+    "openpyxl>=3.1.5",
+    "pillow>=13.0.0",
+    "psycopg[binary]>=3.3.8",
+    "pydantic-settings>=2.16.2",
+    "python-multipart>=0.0.33",
+    "reportlab>=5.1.0",
+    "sqlalchemy>=2.1.8",
+    "uvicorn[standard]>=0.54.0",
+]
+
+[tool.uv.sources]
+# Patched ezdwg (2 fixes, see vendor/ezdwg-inpros-fixes.patch):
+# Linux (Vercel) uses the prebuilt wheel, other platforms build from source (needs Rust).
+ezdwg = [
+    { path = "wheels/ezdwg-0.19.0-cp310-abi3-manylinux_2_28_x86_64.whl", marker = "sys_platform == 'linux'" },
+    { path = "../vendor/ezdwg", marker = "sys_platform != 'linux'" },
+]

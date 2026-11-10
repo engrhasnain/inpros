@@ -1,0 +1,346 @@
+# Document & Layout
+
+## Document
+
+```python
+@dataclass(frozen=True)
+class Document:
+    path: str
+    version: str
+    decode_path: str | None = None
+    decode_version: str | None = None
+    lineweight_table: Mapping[int, int] | None = None
+```
+
+A DWG document. Created by [`ezdwg.read()`](core.md#ezdwgread).
+
+### Properties
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `path` | `str` | Path to the DWG file |
+| `version` | `str` | DWG version code (e.g. `"AC1015"`) |
+| `decode_path` | `str \| None` | Path used for decoding (defaults to `path`) |
+| `decode_version` | `str \| None` | Version used for decoding (defaults to `version`) |
+
+### Methods
+
+#### modelspace
+
+```python
+Document.modelspace() -> Layout
+```
+
+Return the modelspace layout.
+
+**Example:**
+
+```python
+doc = ezdwg.read("drawing.dwg")
+msp = doc.modelspace()
+```
+
+#### graph
+
+```python
+Document.graph(limit: int | None = None) -> DocumentGraph
+```
+
+Return the graph-oriented IR for the document. The graph contains object nodes, common entity data, object edges, layer table rows, block header rows, and inferred model/paper space header handles.
+
+#### header_variables
+
+```python
+Document.header_variables() -> dict[str, Any]
+```
+
+Decode a subset of the DWG header variables. Keys: `insunits`, `lunits`,
+`luprec`, `aunits`, `auprec`, `ltscale`, `textsize`, `extmin`, `extmax`,
+`limmin`, `limmax`. Values are `None` when the variable is absent for the file
+version — R14 (`AC1014`) has no `$INSUNITS` header variable, so every field is
+`None` for R14 files. Raises on unreadable header sections.
+
+```python
+doc = ezdwg.read("drawing.dwg")
+variables = doc.header_variables()
+variables["insunits"]  # 4
+variables["extmin"]    # (0.0, 0.0, 0.0)
+```
+
+#### linetypes
+
+```python
+Document.linetypes() -> dict[str, dict[str, Any]]
+```
+
+Linetype table by name. Each entry holds `handle`, `description`,
+`pattern_length` and `dashes`: the dash pattern in drawing units at linetype
+scale 1, with the DXF sign convention (positive = dash, negative = gap,
+0 = dot). The built-in `ByBlock`, `ByLayer` and `Continuous` entries have an
+empty pattern.
+
+```python
+doc = ezdwg.read("drawing.dwg")
+doc.linetypes()["CENTER"]["dashes"]  # [1.25, -0.25, 0.25, -0.25]
+```
+
+#### layers
+
+```python
+Document.layers -> LayerTable
+Document.layers() -> dict[str, dict[str, Any]]
+```
+
+`doc.layers` is a cached table of immutable `Layer` snapshots. Iterate over
+layers, look up names with `doc.layers["0"]`, or use `by_handle(handle)` and
+`to_records()`. Calling the table preserves the legacy dictionary API below.
+Lineweight is in hundredths of a millimetre; `lineweight_index` is the stored
+DWG enum. `ezdwg.read(path, lineweight_table={9: 35})` accepts a custom mapping.
+Transparency is an optional percentage (0 opaque, up to 90 transparent).
+
+Layer table by name. Each entry holds `handle`, `color_index`, `true_color`,
+`linetype` (the name of the layer's linetype, `None` when it cannot be read)
+and the state of the layer:
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `off` | `bool` | The layer is turned off |
+| `frozen` | `bool` | The layer is frozen |
+| `locked` | `bool` | The layer is locked |
+| `plot` | `bool` | The layer is printed. Always `True` for R13/R14 files, which have no such flag |
+| `lineweight` | `int` | Hundredths of a millimetre; `-3` is the default lineweight (always, for R13/R14 files) |
+
+The entities of a layer that is off or frozen are not shown.
+
+```python
+layers = doc.layers()
+layers["Center"]["linetype"]  # "CENTER"
+
+ltscale = doc.header_variables()["ltscale"] or 1.0
+for entity in doc.modelspace().query("LINE"):
+    name = entity.dxf["linetype"]
+    if name == "BYLAYER":
+        layer = next(v for v in layers.values() if v["handle"] == entity.dxf["layer_handle"])
+        name = layer["linetype"]
+    scale = ltscale * entity.dxf["linetype_scale"]
+```
+
+#### layer states, filters, and viewport overrides
+
+```python
+doc = ezdwg.read("drawing.dwg")
+print(doc.layer_states.names())
+state = doc.layer_state("Saved state")
+if state is not None:
+    preview = state.apply(doc, dry_run=True)
+    result = state.apply(doc)  # updates the cached layer metadata in memory
+
+for layer_filter in doc.layer_filters:
+    print(layer_filter.name, layer_filter.name_pattern)
+for node in doc.layer_filter_tree.walk():
+    print(node.depth, node.name, node.expression)
+```
+
+`LayerStateMasks` selects properties for `diff()` / `apply()`. Use
+`properties=ezdwg.LayerStateMasks.COLOR` to select color alone. Unresolved
+properties are skipped. `skip_missing=False` raises `KeyError` before mutation
+if a referenced layer is missing. `doc.diff_layer_state(name, **kwargs)` and
+`doc.apply_layer_state(name, **kwargs)` offer named-state shortcuts.
+
+Passing `viewport=<entity handle>` applies freeze/display properties to
+`doc.viewport_overrides`. Other flags remain global. Override colors and
+transparency are decoded; override lineweight is in hundredths of a millimetre.
+Without a viewport argument, global layer metadata is restored and the summary
+reports any skipped viewport context.
+
+State/override application changes these metadata tables only. Entity queries,
+plotting, DWG export, and DXF export continue to read their existing decode
+paths; they do not consume the modified tables. There is no DWG write-back.
+
+Layer-state decoding is covered by populated AC1027/AC1032 fixtures. Current
+public fixtures have empty filter/override tables; populated Python table
+behavior is tested with synthetic rows. Native populated filter/override
+decoding remains best effort. `matches_name()` evaluates only a name pattern,
+not arbitrary AcLy expressions or other filter properties.
+
+Native layer results are cached by canonical path, size, and modification time.
+Call `ezdwg.clear_decode_caches()` after batch work or before rereading a file
+whose size/timestamp was preserved. Existing `Document` snapshots remain alive.
+
+#### dimstyles
+
+```python
+Document.dimstyles() -> dict[str, dict[str, Any]]
+```
+
+Dimension style table by name. Each entry holds `handle`, `dimscale` (the
+overall scale; 0 for a style that is scaled by the viewport or annotatively),
+`dimtxt` (text height) and `dimasz` (arrow size). The sizes are in drawing
+units before `dimscale`.
+
+```python
+style = doc.dimstyles()["ISO-25"]
+text_height = style["dimtxt"] * (style["dimscale"] or 1.0)
+```
+
+#### layouts
+
+```python
+Document.layouts() -> dict[str, dict[str, Any]]
+```
+
+Layout table by name, in tab order: the model tab and the paper-space sheets.
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `handle` | `int` | Handle of the layout object |
+| `tab_order` | `int` | Position among the tabs; 0 is the model tab |
+| `model` | `bool` | `True` for the model tab |
+| `active` | `bool` | `True` for the paper-space sheet that was current when the file was saved |
+| `block_record_handle` | `int` | Block record that owns the entities of the layout |
+| `paper_width`, `paper_height` | `float` | Paper size in millimetres, before `plot_rotation` |
+| `margins` | `(float, float, float, float)` | Unprintable margins: left, bottom, right, top; millimetres |
+| `paper_size` | `str` | Name of the paper size |
+| `paper_units` | `int` | 0 inches, 1 millimetres, 2 pixels |
+| `plot_rotation` | `int` | 0-3 quarter turns counter-clockwise |
+| `limmin`, `limmax` | `(float, float)` | Limits of the layout |
+| `extmin`, `extmax` | `(float, float, float)` | Extents of the layout |
+| `viewport_handles` | `list[int]` | Viewports of the layout, the sheet's own viewport first (R2004+; empty before) |
+
+The entities of the active sheet are stored without an owner handle:
+`entity_placement()` gives `(1, None)` for them. The entities of every other
+sheet name the block record of their layout as owner.
+
+```python
+layouts = doc.layouts()
+sheets = {entry["block_record_handle"]: name for name, entry in layouts.items() if not entry["model"]}
+active = next((name for name, entry in layouts.items() if entry["active"]), None)
+
+for entity in doc.paperspace().query():
+    mode, owner = doc.entity_placement(entity.handle)
+    sheet = active if mode == 1 else sheets.get(owner)
+```
+
+Files written before R2000 may hold no layout objects; the table is empty then.
+
+#### units
+
+```python
+Document.units -> str | None
+```
+
+Drawing units name resolved from `$INSUNITS` (e.g. `"millimeters"`,
+`"inches"`, `"unitless"`). Returns `None` when the code is unavailable (R14, or
+an unreadable header). Unknown codes are reported as `"unknown_<code>"`. The
+raw integer code is available as `Document.insunits`.
+
+```python
+doc = ezdwg.read("drawing.dwg")
+doc.units     # "millimeters"
+doc.insunits  # 4
+```
+
+#### plot
+
+```python
+Document.plot(*args, **kwargs) -> Axes
+```
+
+Plot all entities in the modelspace. Accepts the same parameters as [`ezdwg.plot()`](core.md#ezdwgplot).
+
+#### export_dxf
+
+```python
+Document.export_dxf(output_path: str, **kwargs) -> ConvertResult
+```
+
+Export the modelspace to a DXF file. Accepts the same keyword arguments as [`ezdwg.to_dxf()`](core.md#ezdwgto_dxf).
+
+#### export_dwg
+
+```python
+Document.export_dwg(output_path: str, **kwargs) -> WriteResult
+```
+
+Export the modelspace to a DWG file using the native writer. Accepts the same keyword arguments as [`ezdwg.to_dwg()`](core.md#ezdwgto_dwg).
+
+---
+
+## Layout
+
+```python
+@dataclass(frozen=True)
+class Layout:
+    doc: Document
+    name: str
+```
+
+A drawing layout (e.g. modelspace).
+
+### Methods
+
+#### query
+
+```python
+Layout.query(types: str | Iterable[str] | None = None) -> Iterator[Entity]
+```
+
+Iterate over entities, optionally filtered by type.
+
+**Parameters:**
+
+- `types` — Space-separated type names (e.g. `"LINE ARC"`), an iterable of type names, or `None` for all types.
+
+**Returns:** Iterator of [`Entity`](entity.md) objects.
+
+**Examples:**
+
+```python
+# All entities
+for entity in msp.query():
+    print(entity.dxftype)
+
+# Filter by type string
+for line in msp.query("LINE"):
+    print(line.dxf["start"])
+
+# Multiple types
+for entity in msp.query("LINE ARC CIRCLE"):
+    print(entity.dxftype, entity.handle)
+
+# From an iterable
+for entity in msp.query(["LINE", "ARC"]):
+    print(entity.dxftype)
+```
+
+#### iter_entities
+
+```python
+Layout.iter_entities(types: str | Iterable[str] | None = None) -> Iterator[Entity]
+```
+
+Alias for `query()`.
+
+#### plot
+
+```python
+Layout.plot(*args, **kwargs) -> Axes
+```
+
+Plot entities in this layout. Accepts the same parameters as [`ezdwg.plot()`](core.md#ezdwgplot).
+
+#### export_dxf
+
+```python
+Layout.export_dxf(output_path: str, **kwargs) -> ConvertResult
+```
+
+Export this layout to a DXF file. Accepts the same keyword arguments as [`ezdwg.to_dxf()`](core.md#ezdwgto_dxf).
+
+#### export_dwg
+
+```python
+Layout.export_dwg(output_path: str, **kwargs) -> WriteResult
+```
+
+Export this layout to a DWG file using the native writer. Accepts the same keyword arguments as [`ezdwg.to_dwg()`](core.md#ezdwgto_dwg).

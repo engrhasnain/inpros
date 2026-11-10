@@ -1,0 +1,174 @@
+pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    module.add_function(wrap_pyfunction!(detect_version, module)?)?;
+    module.add_function(wrap_pyfunction!(legacy_text_is_representable, module)?)?;
+    module.add_function(wrap_pyfunction!(legacy_text_replace_unrepresentable, module)?)?;
+    module.add_function(wrap_pyfunction!(clear_decode_cache, module)?)?;
+    module.add_function(wrap_pyfunction!(write_ac1015_dwg, module)?)?;
+    module.add_function(wrap_pyfunction!(write_dwg, module)?)?;
+    module.add_class::<DwgWriter>()?;
+    module.add_function(wrap_pyfunction!(release_freed_heap, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_write_geometry, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_mtext_write_properties, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_write_tables, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_write_blocks, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_write_polylines, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_write_splines, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_attribute_links, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_entity_links, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_insert_write_properties, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_write_property_losses, module)?)?;
+    module.add_function(wrap_pyfunction!(write_ac1015_line_dwg, module)?)?;
+    module.add_function(wrap_pyfunction!(list_section_locators, module)?)?;
+    module.add_function(wrap_pyfunction!(read_section_bytes, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_header_variables, module)?)?;
+    module.add_function(wrap_pyfunction!(list_object_map_entries, module)?)?;
+    module.add_function(wrap_pyfunction!(list_object_headers, module)?)?;
+    module.add_function(wrap_pyfunction!(list_object_headers_with_type, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_document_graph, module)?)?;
+    module.add_function(wrap_pyfunction!(list_object_headers_by_type, module)?)?;
+    module.add_function(wrap_pyfunction!(read_object_records_by_type, module)?)?;
+    module.add_function(wrap_pyfunction!(read_object_records_by_handle, module)?)?;
+    module.add_function(wrap_pyfunction!(read_object_records_by_offset, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        decode_object_entity_layer_handles,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(decode_object_handle_stream_refs, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_acis_candidate_infos, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_proxy_graphic_chunk_infos, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        decode_proxy_graphic_text_entities,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(decode_entity_styles, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_entity_placements, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_layer_colors, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_layer_flags, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_layer_color_details, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_layer_names, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_layer_handles, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_layer_eed, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_layer_state_names, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_layer_state_xrecords, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_plotstyles, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_layer_vp_overrides, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_layer_filter_names, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_layer_filter_xrecords, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_layer_filter_tree, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_linetypes, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_layer_linetypes, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_entity_linetypes, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_entity_lineweights, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_layer_states, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_dimstyles, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_line_entities, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_line_owner_handles, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_point_entities, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_point_owner_handles, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_3dface_entities, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_arc_entities, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_arc_owner_handles, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_circle_entities, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_circle_owner_handles, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_line_arc_circle_entities, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_ellipse_entities, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_spline_entities, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_text_entities, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_attrib_entities, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_attdef_entities, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_mtext_entities, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_leader_entities, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_hatch_entities, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_hatch_patterns, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_tolerance_entities, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_mline_entities, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_dimension_entities, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_dim_linear_entities, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_dim_ordinate_entities, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_dim_aligned_entities, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_dim_ang3pt_entities, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_dim_ang2ln_entities, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_dim_diameter_entities, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_dim_radius_entities, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_insert_entities, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_insert_owner_handles, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_minsert_entities, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_insert_minsert_entities, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        decode_insert_minsert_dimension_entities,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(decode_block_header_names, module)?)?;
+    module.add_function(wrap_pyfunction!(embedded_text_shift_bits_bytes, module)?)?;
+    module.add_function(wrap_pyfunction!(embedded_text_utf16_runs, module)?)?;
+    module.add_function(wrap_pyfunction!(embedded_text_is_plausible_char, module)?)?;
+    module.add_function(wrap_pyfunction!(embedded_text_score_fragment, module)?)?;
+    module.add_function(wrap_pyfunction!(embedded_text_normalize_fragment, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        embedded_text_extract_plausible_fragment,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        embedded_text_normalize_direct_custom_fragment,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(embedded_text_visible_fragments, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        embedded_text_shifted_visible_fragments,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        embedded_text_shifted_short_direct_fragments,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(decode_block_entity_names, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_block_entity_name_maps, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_polyline_2d_entities, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        decode_polyline_2d_entities_interpreted,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(decode_lwpolyline_entities, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_lwpolyline_owner_handles, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_polyline_3d_entities, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_polyline_3d_with_vertices, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_polyline_mesh_entities, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        decode_polyline_mesh_with_vertices,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(decode_polyline_pface_entities, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_polyline_pface_with_faces, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_solid_entities, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_trace_entities, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_shape_entities, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_viewport_entities, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_viewport_details, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_layout_objects, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_oleframe_entities, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_ole2frame_entities, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_long_transaction_entities, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_region_entities, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_3dsolid_entities, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_body_entities, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_ray_entities, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_image_entities, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_image_defs, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_xline_entities, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_polyline_2d_with_vertices, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        decode_polyline_2d_with_vertices_interpolated,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(decode_vertex_2d_entities, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_vertex_3d_entities, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_vertex_mesh_entities, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_vertex_pface_entities, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_vertex_pface_face_entities, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        decode_polyline_2d_with_vertex_data,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(decode_polyline_sequence_members, module)?)?;
+    Ok(())
+}

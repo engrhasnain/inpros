@@ -1,0 +1,359 @@
+# Changelog
+
+## Unreleased
+
+### DWG reader
+- R2007: an empty entry at the start of the section map no longer ends the map.
+  Its position depends on the writer, and such files failed with
+  `R2007 section map has no entries`.
+- HATCH spline boundary edges of R2010+ drawings: the start/end tangent pair is
+  stored only together with fit points. AutoCAD 2018 drawings with zero fit
+  points (production files, 36 of 600 DWGs) were read 32 bytes off from the
+  first spline edge on, so every following edge and path came back empty or
+  shifted (``paths=[]``, corrupt pattern names, ``extrusion (0, 1, 0)``) and
+  the hatches were dropped. The tangents are now read when fit points exist or
+  when the next four doubles look like a tangent pair.
+- A HATCH whose every decode candidate lacks a usable boundary is reported as a
+  decode failure instead of an entity with empty paths.
+
+### Rust crate distribution
+- `writer::WriterEntity` boxes its large variants (`Spline`, `Face3d`,
+  `Insert`, `Attdef`, `Attrib`, `Hatch`, `Dimension`, `Image`, `Viewport`),
+  so the enum is 328 bytes instead of 568 and a document of a million lines
+  and polylines is a quarter smaller. Code that constructs or matches these
+  variants needs `Box::new(...)` / `*boxed` (hence 0.18.0).
+- Prepare `ezdwg-core` for crates.io with package metadata, a Rust README and
+  the MIT license. Verify the packaged crate and its documentation examples
+  in CI, and publish tagged releases with `CARGO_REGISTRY_TOKEN`.
+- Mark the Python extension crate as private to Cargo; Python builds continue
+  to use the local Rust core and the shared workspace version.
+
+### Native DWG writer
+- (0.18.0, extended in 0.18.1) Saving a large drawing no longer builds every
+  Python-side copy of every entity at once, nor a Rust document of every
+  entity. `to_dwg` /
+  `Drawing.save` prepare entities in batches of 4,096 (normalise, validate,
+  encode strings, build rows) and hand each batch to the new incremental
+  `ezdwg.raw.DwgWriter`. The writer knows the largest entity handle up front
+  (`max_handle`), allocates the handles of tables and generated objects above
+  it, and encodes every entity to its object record as soon as the next
+  entity of its layout fixes the chain (`writer::DocumentEncoder`); only the
+  record bytes, about a hundred per entity, and a handle index stay in memory
+  until the tables, header and object map are written, and AC1015 files are
+  streamed to the destination section by section. INSERTs wait for their
+  ATTRIBs until the end. The code page is still selected from every string
+  first, strict saves still fail before anything is written, and the output
+  does not depend on the batch size. A synthetic drawing of 850,000
+  three-point LWPOLYLINEs saves with a peak of 993 MB RSS instead of
+  3,023 MB (document 834 MB), in 39 s instead of 40 s; the resident
+  size after the save drops to 856 MB from 1,178 MB because the
+  writer returns its freed heap to the operating system (glibc). A converter
+  writing a 3-sheet DWF plot set of 850,000 entities as DWG peaked at
+  2,479 MB instead of 4,624 MB for the whole process, and the save itself no
+  longer sets the peak (it adds about 100 MB to the 2,000 MB the parsed
+  drawing and the Python `Drawing` occupy).
+- (0.19.0) `ezdwg.new_streaming(version, max_entities=16_777_216)` returns a
+  write-only `StreamingDrawing`: the tables and `add_*` methods of `Drawing`,
+  but no entity is kept. Each one is validated, normalised, encoded and queued,
+  and every 4,096 the queue is written to object records by `raw.DwgWriter`,
+  so a converter's Python side stays at a few megabytes whatever the drawing
+  size (a 1.7-million-entity plot set used to hold 1.4 GB of entity
+  dictionaries). Layers, linetypes, text styles, blocks and image definitions
+  may still be added after entities (`raw.DwgWriter.add_tables`; a known name
+  replaces that row), `set_paper` may follow the paper-space entities, and
+  ATTRIBs attach to INSERTs written earlier. Set `header["codepage"]` before
+  the first entity; `query`, `update`, `delete` and `attribs` are not available
+  and `save` finishes the drawing. Entity handles are numbered from 1 up to
+  `max_entities`; tables and generated objects follow.
+- (0.18.1) Fresh handles (tables, polyline vertices, SEQENDs, image reactors,
+  the paper viewport) are allocated above the largest input handle in arrival
+  order, so files holding those objects get different handle numbers than
+  0.17 wrote (same content), and image definitions no IMAGE references are no
+  longer written. Without `max_handle` (the one-shot `write_dwg`) the
+  entities are buffered in a document and encoded on `write`.
+- Entities of a `Drawing` are now stored in their drawing (insertion) order,
+  which AutoCAD uses as the draw order, instead of grouped by kind. Texts
+  drawn before a solid hatch no longer end up on top of it. The one-shot raw
+  `write_dwg` / `write_ac1015_dwg` keep their documented grouping by kind.
+- `ezdwg.raw.DwgWriter(version)`: `set_tables(...)`, any number of
+  `add(...)` batches (the `write_dwg` keyword groups plus `entity_attributes`,
+  `entity_owners` and an optional `order` of group tags that interleaves the
+  groups of one batch), then `write(path)`. ATTRIBs may arrive in a later
+  batch than their INSERT. The writer returns freed heap to the operating
+  system when it is created (so a parsed source document the caller already
+  dropped does not count towards its peak) and after it has written. `ezdwg.raw.decode_entity_links(path)`
+  returns the `(handle, previous, next)` chain of every entity, i.e. the
+  stored draw order, and `ezdwg.raw.release_freed_heap()` exposes the trim.
+- `Drawing` copies entity dictionaries with a JSON-like copy instead of
+  `deepcopy` when adding, updating and saving entities (same result for the
+  numbers, strings, tuples, lists and dicts they hold; several times faster).
+- Add native AC1032 output with exact entity/layer RGB colors and UTF-16
+  strings, including mixed-language names and supplementary characters.
+  Select it with `ezdwg.new("AC1032")`, `to_dwg(..., version="AC1032")`,
+  `Document.edit(version="AC1032")` or `--dwg-version AC1032`.
+  The initial scope is basic model-space geometry, TEXT/MTEXT and nested static
+  blocks with single-line attributes. AC1015 remains the default and retains
+  its broader entity and paper-space support.
+- Text whose cp1252 bytes start like a UTF-16 byte order mark (``ÿþ`` = FF FE,
+  ``ï»¿`` = EF BB BF) is written as is: the writer's round-trip check decoded
+  the bytes with BOM sniffing and rejected such strings as "not representable in
+  DWG codepage 30" (DGN texts decoded with a code page start that way).
+- The write preflight checks representability with the writer's own table
+  (encoding_rs) as well as Python's codec, and ``ezdwg.is_representable`` /
+  ``ezdwg.replace_unrepresentable`` expose that check. Characters only Python's
+  codec maps (cp932's private-use U+F8F0–U+F8F3 for the undefined bytes A0 and
+  FD–FF) are replaced by ``?`` with a diagnostic instead of failing the file.
+- Add paper-space layouts: `Drawing.paperspace()` holds the entities of `*Paper_Space`
+  (title block lines, text, ...) and `Drawing.layout` / `Drawing.set_paper(width, height,
+  margins=..., name=...)` describe the sheet of the `Layout1` LAYOUT object (paper size in
+  millimetres, margins, AutoCAD paper size name such as `ISO_A3_(420.00_x_297.00_MM)`, plot
+  type/rotation/scale, limits and extents around the paper). Paper-space entities are stored
+  as AutoCAD stores the current paper-space layout (entmode 1, owned by the `*Paper_Space`
+  block record) and the header's paper-space limits follow the sheet.
+- Add native VIEWPORT writing (`add_viewport(center, width, height, view_center=...,
+  view_height=..., frozen_layers=..., locked=True)`): the complete R2000 body (view target,
+  direction and twist, view height, lens length, clip planes, snap/grid, circle zoom, status
+  flags, style sheet, render mode, viewport UCS) with the frozen layer, clip boundary,
+  viewport entity header and UCS handle data. `view_height / height` is the scale
+  denominator, so a 1:100 viewport shows `height * 100` drawing units. The writer puts the
+  sheet's own viewport (AutoCAD id 1, status `0xC8020`, covering the paper) in front of the
+  user's viewports and names it as the LAYOUT's active viewport. Verified bit for bit against
+  AutoCAD-written AC1015 viewports, by reader roundtrips and by ODA read/resave; `ezdwg.read`
+  returns the viewports through `Document.paperspace()` and the sheet through
+  `Document.layouts()`. `Document.edit()` and `to_dwg` from a file still import model space
+  and blocks only; the paper space of an existing drawing is reported as before
+  (`DOCUMENT.spaces`, dropped; strict imports keep rejecting it) and is not carried over yet.
+- Choose the legacy code page per drawing from `WRITE_CODEPAGES` (ANSI_1252, 932, 936,
+  949, 950, 1250–1257, 874) instead of cp1252-or-cp932: the first page that stores every
+  string wins (Japanese stays ANSI_932, Hangul prefers ANSI_949, Cyrillic/Thai/Hebrew/Arabic
+  text without CJK takes its own Windows page), otherwise the one with the fewest
+  replacements. `Drawing.header["codepage"]` forces a page; `ezdwg.select_codepage` exposes
+  the choice. Chinese, Korean and Cyrillic text is no longer written as `?`.
+- Add native HATCH writing: `add_hatch` with polyline paths (bulges) or
+  line/arc/ellipse/spline edge paths, solid fills and pattern fills with their
+  definition lines (built-in `ANSI31`/`ANSI32`/`ANSI33`/`ANSI37`/`DOTS`/`LINE`/
+  `NET` or `acad.pat` rows, rotated and scaled on insertion), hatch style,
+  elevation, extrusion, pixel size and seed points. Editable imports keep the
+  tessellated boundaries of a read hatch; `to_dwg` carries HATCH through a
+  re-export. Verified by reader roundtrips and ODA read/resave.
+- Add native DIMENSION writing for linear, aligned, radius, diameter, angular
+  (3-point and 2-line) and ordinate dimensions with the common dimension data,
+  a `Standard` DIMSTYLE record (ISO-25 like defaults, `.` decimal separator,
+  header `DIMSTYLE` handle) and an anonymous block (`*D1`, ...) rendered from
+  the definition points: extension lines, dimension line, filled arrowheads and
+  measurement text. Helpers `add_linear_dim`, `add_aligned_dim`,
+  `add_radius_dim`, `add_diameter_dim`, `add_angular_dim`, `add_ordinate_dim`
+  and `add_dimension`; `update()` renders the block again; `geometry` selects a
+  user-built block. Editable imports and re-exports keep existing dimension
+  blocks. Verified by reader roundtrips and ODA read/resave.
+- Add native IMAGE writing (`AcDbRasterImage` class) with `Drawing.image_defs`
+  and `add_image`: insertion, pixel step vectors, size, display properties,
+  brightness/contrast/fade, rectangular or polygonal clip boundary, plus the
+  IMAGEDEF, IMAGEDEF_REACTOR and RASTERVARIABLES objects, the `IMAGE` classes
+  and the `ACAD_IMAGE_DICT`/`ACAD_IMAGE_VARS` dictionary entries. The reader
+  decodes IMAGE entities (`decode_image_entities`, `decode_image_defs`) and
+  `Document.edit()` recreates `image_defs`. Verified by ODA read/resave.
+- Accept `true_color` (`0xRRGGBB`) on entities, layers and imported documents:
+  AC1015 stores ACI only, so the nearest of the 255 palette entries is written
+  (black and white map to 7) and reported with action `approximated`, which no
+  longer fails strict saves or strict `Document.edit()` imports.
+- The DWG header now writes `DIMDSEP` as `.` (46) instead of `,`.
+- Add native SPLINE writing, `add_spline` / `add_spline_fit`, editable imports,
+  block support and keyword-only raw spline rows. Retain control points, knots,
+  rational weights, closure/periodicity, tolerances, fit points and endpoint tangents.
+  Validate knot/control/weight counts and reject incompatible mixed representations,
+  closed/non-cubic fit splines and unsupported newer fit parameterization.
+- Read spline weights using their explicit presence bit and select R2013+ spline
+  bodies using fit flags and knot parameterization. Add supplementary spline
+  metadata without changing the existing raw tuple shape. Verify ODA read/resave,
+  evaluated curves and independent AC1015/AC1018/AC1027 import/edit/export.
+- Add SOLID/TRACE/3DFACE writing, creation helpers, editable imports and block
+  support. Preserve stored corner order, planar OCS elevation/thickness/extrusion,
+  WCS 3D corners and invisible edge masks. Reject invalid corner counts, unequal
+  planar elevations and invalid edge masks before replacing output. Verify native
+  roundtrips and ODA read/resave and independent AC1015/AC1018/AC1027 edits.
+- Preserve raw-row geometry formatting when applying a partial entity attribute
+  dictionary, including SOLID/TRACE thickness and extrusion and ELLIPSE normals.
+- Add ordinary legacy POLYLINE_2D/POLYLINE_3D writing with owned VERTEX/SEQEND
+  records, `add_polyline2d` / `add_polyline3d`, editable imports and block support.
+  Retain 2D widths/bulges/elevation/extrusion/thickness and 3D WCS vertices.
+  Rebuild structural child handles; diagnose unsupported child properties, XDATA,
+  vertex IDs, fit/mesh data and missing/inconsistent references before strict saves.
+- Resolve legacy polyline vertices through first/last and next references,
+  retain the last closed-2D vertex's widths/bulge when no closure point was removed,
+  and consume the R2010+ vertex ID before reading tangent direction.
+- Add full and partial ELLIPSE writing, `EditableLayout.add_ellipse`, editable
+  imports and block-contained ellipses. Retain WCS center/major-axis vectors,
+  extrusion, axis ratio and radian parameters; validate degenerate geometry.
+  Add existing R14/R2004/R2007/R2010/R2013 fixture roundtrips and independent
+  ODA read/resave and import/edit/export checks.
+- Add static named/anonymous blocks, nested INSERT references and single-line
+  ATTDEF/ATTRIB writing, including base points, per-axis scale, normals and text
+  formatting. Preserve the ownership graph and attribute SEQEND records.
+- Add `Drawing.blocks`, block creation, `add_blockref`, `add_attdef`, `add_attrib`
+  and attribute editing/deletion. Import definitions and attached attributes into
+  independent editable snapshots; include block dependencies in filtered exports.
+- Reject undefined/cyclic references, duplicate handles/tags and invalid ownership
+  before replacing output. Include unsupported block contents in strict diagnostics.
+- Preserve ATTRIB order through legacy links and newer owned-handle arrays;
+  diagnose missing or inconsistent attribute references during editable import.
+- Read INSERT colors and normals, and follow INSERT ownership for nested attribute
+  layout membership. Add ODA nested/reflected block and independent-input regressions.
+- Add `ezdwg.new()`, independent `Document.edit()` snapshots, and `Drawing.save()`.
+  Add, update, query and delete the nine supported model-space entity types with
+  stable handles; edit layer/linetype/text-style definitions and unit settings.
+  Import diagnostics remain visible and strict saves reject known losses.
+- Write completed DWGs to synced sibling temporary files before atomic replacement;
+  clean temporary files on failure and invalidate decode caches after saving.
+  Add failure-injection, same-path edit/save and ODA edit/resave regressions.
+- Preserve referenced layers, ACI/BYLAYER/BYBLOCK, simple linetypes, lineweights,
+  visibility, units, basic text styles, text placement/spacing, and polyline
+  elevation/extrusion/thickness. Read/write Japanese legacy text without byte replacement.
+- Add `WriteResult.diagnostics` and strict rejection of detected attribute loss,
+  including TrueColor, transparency, XDATA and unresolved/unsupported references.
+  Validate finite geometry, positive radii/heights and nonzero directions before saving.
+- Extend raw writer calls with optional attribute/table/metadata keywords while
+  retaining existing positional arguments. Add styled external roundtrip/loss tests.
+- Build the minimal AC1015 database graph, header variables, standard tables,
+  dictionaries and layouts; write CRCs, explicit entity links and paged object maps.
+- Correct native LWPOLYLINE closure and TEXT/MTEXT style references.
+- Export model space by default and include unsupported/undecoded entities in
+  strict validation and skipped counts. Block definition geometry no longer leaks
+  into the output model space. Explicit type filters retain their selection scope.
+- Add an opt-in ODA read/resave regression for empty, mixed and multi-page output.
+
+### Added
+- Structured `Document.layers` (`Layer` / `LayerTable`) with callable legacy
+  `doc.layers()` access, lineweight conversion, and EED transparency/description.
+- Layer-state discovery, masked in-memory diff/apply, property/nested filter
+  discovery, and viewport layer override metadata. These metadata changes are
+  not written to DWG/DXF or used by plotting.
+- Shared native layer decode cache with file metadata invalidation and
+  `clear_decode_caches()` support.
+- Native `AC1021` (`R2007`) read path in the high-level API (`ezdwg.read`) without compatibility conversion.
+- Native `AC1024` (`R2010`) read path in the high-level API (`ezdwg.read`) for `LINE`, `ARC`, and `LWPOLYLINE`.
+- Native `AC1027` (`R2013`) read path in the high-level API (`ezdwg.read`) for `LINE`, `ARC`, and `LWPOLYLINE`.
+- AC1021 regression suite covering:
+  - Rust object/entity decode checks for `LINE`, `ARC`, `LWPOLYLINE`.
+  - Python high-level and raw API checks with paired sample files.
+  - CLI `inspect` verification for native `decode_version: AC1021`.
+- AC1024 regression suite covering high-level and raw geometry checks against paired DXF samples for:
+  - `LINE`
+  - `ARC`
+  - `LWPOLYLINE`
+- AC1027 regression suite covering high-level and raw geometry checks against paired DXF samples for:
+  - `LINE`
+  - `ARC`
+  - `LWPOLYLINE`
+- R2007+/R2010+/R2013+ regression coverage for:
+  - `POINT`
+  - `CIRCLE`
+  - `ELLIPSE`
+- TEXT/MTEXT regression coverage for `R2000`/`R2004` sample pairs.
+
+### Changed
+- Centralized the Rust and Python release version in the root `Cargo.toml`, with
+  `uv run scripts/bump_version.py <version>` to refresh locks and CI checks for
+  version/tag mismatches.
+- Removed the external DWG compatibility-conversion path from `ezdwg.read`; AC10xx versions in scope now use native decode paths.
+- R2007/R2010/R2013 entity decoding now uses version-aware common header paths for:
+  - `LINE`
+  - `ARC`
+  - `LWPOLYLINE`
+  - `POINT`
+  - `CIRCLE`
+  - `ELLIPSE`
+  - `TEXT`
+  - `MTEXT`
+  - `DIMENSION` (linear/radius/diameter)
+  to account for `material flags`, `shadow flags`, R2010 visual-style bits, and the R2013+ ds-binary-data flag.
+
+### Fixed
+- Reading POLYLINE_2D / POLYLINE_3D sequences no longer rebuilds the handle → offset
+  index once per polyline. `decode_polyline_sequence_members`, the 2D/3D vertex rows
+  and the write-polyline metadata build the index once per pass, so a drawing with
+  23k POLYLINE_2D among 163k objects reads in seconds instead of 65 s. Output is
+  unchanged.
+- `list_object_headers_with_type`, `decode_block_header_names` and
+  `decode_entity_linetypes` now decode once per file and serve repeated calls from
+  the shared path-keyed cache (`FileDecodeState` in `cache.rs`, keyed by path, size
+  and mtime like the LAYER table; `limit` is applied to the cached rows). One read of
+  a Document asked for the object headers seven times and for the other two tables
+  twice. `clear_decode_caches()` drops these entries as well. Output is unchanged.
+- Every decode pass now starts from one shared `DecodedFile` per (path, size,
+  mtime): the file bytes, the decompressed objects section (R2004+/R2007), the
+  object index and the CLASSES maps are built once and each pass only parses its
+  own records. Reading a 200k-object drawing ran that prologue about 25 times
+  (0.15-0.2 s each). `Decoder::with_objects_section`/`objects_section` share the
+  section between decoders.
+- The block-name resolution tables (`InsertNameResolutionState`) are built once
+  per file and shared by the BLOCK_HEADER, INSERT, MINSERT and DIMENSION passes;
+  before, each pass rebuilt them (3.8 s each on a drawing with 31k block
+  headers). Inside the build, assigning INSERT handles to block headers used
+  linear scans over the sorted handle list that turned quadratic once most
+  handles were assigned (2.7 s); two ordered sets answer the same lookups, and
+  the bit-by-bit handle scan tests membership with a bitmap instead of a hash
+  map. Results are unchanged.
+- Object-map page offsets, body-handle identity, 64-bit handle references, and
+  string-stream size metadata. Layer-state lineweights and viewport colors/
+  transparency now use decoded units, including true-color black and ACI restore.
+- `POLYLINE_2D` / `POLYLINE_3D` / `POLYLINE_PFACE` / `POLYLINE_MESH`: the "Owned Object
+  Count" BL is only read for R2004+ layouts (ODA spec 20.4.16 / 20.4.17 / 20.4.33 / 20.4.34).
+  R2000 files used to read the count from unrelated bits, which silently dropped most 2D
+  polylines (6 of 334 decoded in one R2000 drawing) and, when the garbage value was large,
+  aborted the whole process with `memory allocation of N bytes failed`.
+- Handle-reference counts (owned objects, reactors) are validated against the remaining
+  handle stream before `Vec::with_capacity`, so corrupted R2004+ objects fail with a
+  `Format` error for that entity instead of aborting the process.
+- R2007 (`AC1021`) data pages: the Reed-Solomon block count is now derived from the
+  compressed size padded to the 8-byte CRC block (ODA 5.4). A bare
+  `ceil(compressed / 251)` was one block short whenever that padding crossed a
+  251-byte boundary, so the de-interleave stride was wrong and decompression
+  failed with "back-reference offset exceeds decompressed prefix" (seen on the
+  `AcDb:Handles` section of real files). A page-size based stride is tried as a
+  fallback before giving up.
+
+- HATCH on R2007+ (`AC1021`+): the pattern/gradient names live in the object's
+  string stream and consume no bits in the data stream. The decoder used to read
+  them inline, which shifted every following field; most R2007+ hatches only
+  survived through the polyline-scan fallback and some produced empty
+  boundaries. Candidate scoring now penalizes empty/degenerate paths and a
+  zero extrusion, so a misaligned candidate can no longer outrank the real one.
+- HATCH spline boundary edges (edge type 4, including the R2010+ fit-point
+  block) are decoded and sampled instead of failing the entity.
+
+- DIMENSION on R2007 (`AC1021`) now tries the string-stream layout first (no
+  version byte, user text not in the data stream) — the same class of bug as
+  the HATCH one; the R2000-style inline-text variants remain a fallback. Real
+  R2007 drawings no longer yield dimensions with absurd/non-planar values.
+- DIMENSION plausibility scoring now penalizes garbage magnitudes
+  (`0 < |v| < 1e-30`, the signature of doubles read at the wrong bit offset)
+  and the R2000/R2004 spec layout is tried first, so a mis-aligned candidate can
+  no longer win a tie against the correct one (real AC1018 files had 31/108
+  dimensions with unit-vector-like definition points and spurious Z values).
+- DIAMETER/RADIUS dimensions on R2000-R2007 decode their own specific data
+  (`15-pt / 10-pt / leader length`) instead of being delegated to the LINEAR
+  layout.
+- ANG2LN / ANG3PT / ALIGNED / ORDINATE dimensions decode their own type-specific
+  tail (ODA 20.4.23-20.4.27: ANG2LN `2RD 16-pt, 3BD 13/14/15/10`, ANG3PT
+  `3BD 10/13/14/15`, ALIGNED without the dimension rotation, ORDINATE
+  `3BD 10/13/14, RC flags`) instead of the LINEAR tail. With the LINEAR tail
+  every point after the 12-pt was read at the wrong bit offset (for ANG2LN the
+  leading 16 raw bytes of the 16-pt shifted everything), the candidate was
+  rejected as implausible and the entity surfaced as an all-zero placeholder row.
+  Verified against the paired ACadSharp DXF samples for AC1015-AC1032.
+- Dimension rows gained a 12th element `(point15, point16)` — DXF codes 15/16
+  (angular vertex / second line start, and the 2-line angular arc point;
+  RADIUS/DIAMETER expose their 15-pt there too). The high-level document maps
+  them to `defpoint4` / `defpoint5`; the first 11 elements are unchanged.
+- R13 (`AC1012`) files are accepted and decoded through the R13/R14 path.
+- The R13/R14 common entity header is parsed with the ODA layout first
+  (`RL bitsize, BB entmode, BL numreactors, B isbylayerlt, B nolinks, BS color,
+  BD ltscale, BS invisibility` — no xdictionary flag, no ltype/plotstyle flag
+  pair, no lineweight byte); the previous guessed layouts remain as fallbacks.
+  Real R13 drawings that decoded to garbage coordinates now decode cleanly.
+
+### Notes
+- This release keeps API signatures stable (`ezdwg.read`, `ezdwg.raw`, entity decode functions).
+- ARC angles remain radians in `ezdwg.raw` and degrees in the high-level API.
+- AC1021/AC1024/AC1027 style-handle and layer-color resolution for LINE/ARC/LWPOLYLINE is currently best-effort on some files.

@@ -1,0 +1,24 @@
+# Client data (confidential): drawings and meeting notes are uploaded through the app, not stored in git
+Data and Meeting Summary/
+data/dxf/
+data/inventory/
+data/samples/3erNLUMI.dxf
+
+# Runtime data
+backend/storage/
+backend/*.db
+backend/backup-old-data-*/
+backend/tools/
+
+# Dependencies and builds
+.venv/
+node_modules/
+.next/
+vendor/ezdwg/target/
+__pycache__/
+*.py[oc]
+
+# Local env and Vercel
+.env
+.env.local
+.vercel

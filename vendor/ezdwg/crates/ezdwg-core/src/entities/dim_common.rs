@@ -1,0 +1,306 @@
+//! Shared helpers for dimension entity decoders.
+//!
+//! The R2010+ dimension variants and plausibility scoring heuristics are
+//! identical across `dim_linear`, `dim_diameter`, and `dim_radius`, so they
+//! live here to avoid drift between copies.
+
+use crate::bit::BitReader;
+use crate::core::result::Result;
+use crate::entities::common::{
+    parse_common_entity_handles, read_handle_reference, CommonEntityHeader,
+};
+use crate::entities::dim_linear::DimLinearEntity;
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct R2010PlusVariant {
+    pub(crate) has_dimension_version: bool,
+    pub(crate) has_user_text: bool,
+    pub(crate) extrusion_is_be: bool,
+    /// R2007+ `B unknown; B flip arrow1; B flip arrow2` after the measurement.
+    pub(crate) has_r2007_flags: bool,
+}
+
+/// R2000/R2004 layout of the common dimension data: no version byte, inline
+/// TV user text, no R2007+ flag bits. Listed spec-first so ties keep it.
+pub(crate) const R2000_VARIANTS: [R2010PlusVariant; 2] = [
+    R2010PlusVariant {
+        has_dimension_version: false,
+        has_user_text: true,
+        extrusion_is_be: false,
+        has_r2007_flags: false,
+    },
+    R2010PlusVariant {
+        has_dimension_version: false,
+        has_user_text: true,
+        extrusion_is_be: true,
+        has_r2007_flags: false,
+    },
+];
+
+pub(crate) const R2010_PLUS_VARIANTS: [R2010PlusVariant; 8] = [
+    R2010PlusVariant {
+        has_dimension_version: true,
+        has_user_text: true,
+        extrusion_is_be: false,
+        has_r2007_flags: true,
+    },
+    R2010PlusVariant {
+        has_dimension_version: true,
+        has_user_text: false,
+        extrusion_is_be: false,
+        has_r2007_flags: true,
+    },
+    R2010PlusVariant {
+        has_dimension_version: false,
+        has_user_text: true,
+        extrusion_is_be: false,
+        has_r2007_flags: true,
+    },
+    R2010PlusVariant {
+        has_dimension_version: false,
+        has_user_text: false,
+        extrusion_is_be: false,
+        has_r2007_flags: true,
+    },
+    R2010PlusVariant {
+        has_dimension_version: true,
+        has_user_text: true,
+        extrusion_is_be: true,
+        has_r2007_flags: true,
+    },
+    R2010PlusVariant {
+        has_dimension_version: true,
+        has_user_text: false,
+        extrusion_is_be: true,
+        has_r2007_flags: true,
+    },
+    R2010PlusVariant {
+        has_dimension_version: false,
+        has_user_text: true,
+        extrusion_is_be: true,
+        has_r2007_flags: true,
+    },
+    R2010PlusVariant {
+        has_dimension_version: false,
+        has_user_text: false,
+        extrusion_is_be: true,
+        has_r2007_flags: true,
+    },
+];
+
+/// Handle stream of a dimension: the common entity handles come first, then
+/// the DIMSTYLE and the anonymous BLOCK (ODA spec 20.4.22).
+///
+/// Returns `(dimstyle, anonymous_block, layer)`.
+pub(crate) fn read_dimension_handles(
+    reader: &mut BitReader<'_>,
+    header: &CommonEntityHeader,
+) -> Result<(u64, u64, u64)> {
+    let common_handles = parse_common_entity_handles(reader, header)?;
+    let dimstyle = read_handle_reference(reader, header.handle)?;
+    let block = read_handle_reference(reader, header.handle)?;
+    Ok((dimstyle, block, common_handles.layer))
+}
+
+pub(crate) fn plausibility_score(entity: &DimLinearEntity) -> u64 {
+    let mut score = 0u64;
+    let common = &entity.common;
+
+    for pt in [
+        entity.point10,
+        entity.point13,
+        entity.point14,
+        common.text_midpoint,
+    ] {
+        score = score.saturating_add(point_score(pt));
+    }
+    if let Some(insert_point) = common.insert_point {
+        score = score.saturating_add(point_score(insert_point));
+    }
+    if let Some(point15) = entity.point15 {
+        score = score.saturating_add(point_score(point15));
+    }
+    if let Some((x16, y16)) = entity.point16 {
+        score = score.saturating_add(point_score((x16, y16, 0.0)));
+    }
+    score = score.saturating_add(point_score(common.extrusion));
+    score = score.saturating_add(point_score(common.insert_scale));
+    score = score.saturating_add(extrusion_score(common.extrusion));
+    score = score.saturating_add(scale_score(common.insert_scale));
+
+    // For DIM_DIAMETER and DIM_RADIUS ext_line_rotation/dim_rotation are fixed
+    // at 0.0, and angle_score(0.0) == 0, so including them here is a no-op for
+    // those entity types.
+    for angle in [
+        common.text_rotation,
+        common.horizontal_direction,
+        entity.ext_line_rotation,
+        entity.dim_rotation,
+        common.insert_rotation,
+    ] {
+        score = score.saturating_add(angle_score(angle));
+    }
+
+    if let Some(measurement) = common.actual_measurement {
+        score = score.saturating_add(value_score(measurement));
+    }
+    if let Some(line_spacing) = common.line_spacing_factor {
+        score = score.saturating_add(value_score(line_spacing));
+    }
+    if let Some(attachment_point) = common.attachment_point {
+        if attachment_point > 9 {
+            score = score.saturating_add(10_000);
+        }
+    }
+    if let Some(line_spacing_style) = common.line_spacing_style {
+        if line_spacing_style > 2 {
+            score = score.saturating_add(10_000);
+        }
+    }
+    if common.dim_flags > 0x3F {
+        score = score.saturating_add(1_000);
+    }
+
+    score
+}
+
+pub(crate) fn extrusion_score(extrusion: (f64, f64, f64)) -> u64 {
+    if !extrusion.0.is_finite() || !extrusion.1.is_finite() || !extrusion.2.is_finite() {
+        return 1_000_000;
+    }
+    let norm_sq = extrusion.0 * extrusion.0 + extrusion.1 * extrusion.1 + extrusion.2 * extrusion.2;
+    if norm_sq <= 1e-12 {
+        return 50_000;
+    }
+    let norm = norm_sq.sqrt();
+    let mut score = 0u64;
+    let norm_err = (norm - 1.0).abs();
+    if norm_err > 0.25 {
+        score = score.saturating_add(25_000);
+    } else if norm_err > 0.05 {
+        score = score.saturating_add(2_500);
+    }
+    if extrusion.2.abs() < 0.5 {
+        score = score.saturating_add(250);
+    }
+    score
+}
+
+pub(crate) fn scale_score(scale: (f64, f64, f64)) -> u64 {
+    let mut score = 0u64;
+    for value in [scale.0, scale.1, scale.2] {
+        if !value.is_finite() {
+            return 1_000_000;
+        }
+        if value.abs() < 1e-12 {
+            score = score.saturating_add(2_500);
+        } else if value.abs() > 1_000.0 {
+            score = score.saturating_add(250);
+        }
+    }
+    score
+}
+
+pub(crate) fn point_score(point: (f64, f64, f64)) -> u64 {
+    value_score(point.0)
+        .saturating_add(value_score(point.1))
+        .saturating_add(value_score(point.2))
+}
+
+/// Magnitudes below this (but not exactly zero) never occur in drawing data;
+/// they are the signature of raw bits read at the wrong offset (denormal-ish
+/// exponents such as 8.9e-307), so they must lose against a clean candidate.
+const GARBAGE_MAGNITUDE: f64 = 1.0e-30;
+
+pub(crate) fn angle_score(value: f64) -> u64 {
+    if !value.is_finite() {
+        return 1_000_000;
+    }
+    let abs = value.abs();
+    if abs > 0.0 && abs < GARBAGE_MAGNITUDE {
+        return 5_000;
+    }
+    if abs <= 1_000.0 {
+        0
+    } else if abs <= 1_000_000.0 {
+        25
+    } else if abs <= 1_000_000_000_000.0 {
+        250
+    } else {
+        1_000_000
+    }
+}
+
+pub(crate) fn value_score(value: f64) -> u64 {
+    if !value.is_finite() {
+        return 1_000_000;
+    }
+    let abs = value.abs();
+    if abs > 0.0 && abs < GARBAGE_MAGNITUDE {
+        return 5_000;
+    }
+    if abs <= 1_000_000.0 {
+        0
+    } else if abs <= 1_000_000_000.0 {
+        10
+    } else if abs <= 1_000_000_000_000.0 {
+        100
+    } else if abs <= 1.0e18 {
+        1_000
+    } else if abs <= 1.0e24 {
+        10_000
+    } else {
+        1_000_000
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::read_dimension_handles;
+    use crate::bit::{BitReader, BitWriter, Endian};
+    use crate::entities::common::parse_common_entity_header;
+
+    #[test]
+    fn dimension_handles_follow_the_common_entity_handles() {
+        // R2004 common entity data: model space (no owner handle), no reactors,
+        // no xdictionary, linetype by handle.
+        let mut data = BitWriter::new();
+        data.write_h(0, 0x514).expect("write handle");
+        data.write_bs(0).expect("write ext size");
+        data.write_b(0).expect("write graphic flag");
+        data.write_bb(2).expect("write entity mode");
+        data.write_bl(0).expect("write reactors");
+        data.write_b(1).expect("write xdic missing");
+        data.write_bs(256).expect("write color");
+        data.write_bd(1.0).expect("write ltype scale");
+        data.write_bb(3).expect("write ltype flags");
+        data.write_bb(0).expect("write plotstyle flags");
+        data.write_bs(0).expect("write invisibility");
+        data.write_rc(0).expect("write line weight");
+
+        // Handle stream: layer, linetype, then DIMSTYLE and the anonymous BLOCK.
+        let mut handle_stream = BitWriter::new();
+        for (code, value) in [(5, 0x10), (5, 0x16), (5, 0x39A), (5, 0x529)] {
+            handle_stream
+                .write_h(code, value)
+                .expect("write handle ref");
+        }
+
+        let obj_size = 32 + data.len_bits();
+        let mut out = BitWriter::new();
+        out.write_rl(Endian::Little, obj_size as u32)
+            .expect("write obj size");
+        out.write_bits_from_bytes(&data.to_bytes(), data.len_bits())
+            .expect("write data");
+        out.write_bits_from_bytes(&handle_stream.to_bytes(), handle_stream.len_bits())
+            .expect("write handles");
+        let bytes = out.into_bytes();
+
+        let mut reader = BitReader::new(&bytes);
+        let header = parse_common_entity_header(&mut reader).expect("header");
+        reader.set_bit_pos(header.obj_size);
+        let (dimstyle, block, layer) =
+            read_dimension_handles(&mut reader, &header).expect("handles");
+        assert_eq!((dimstyle, block, layer), (0x39A, 0x529, 0x10));
+    }
+}

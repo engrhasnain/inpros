@@ -1,0 +1,196 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    name: Verify release version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: astral-sh/setup-uv@v7
+      - name: Check versions and release tag
+        env:
+          RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+        run: |
+          if [[ -n "${RELEASE_TAG}" ]]; then
+            uv run scripts/bump_version.py --check --tag "${RELEASE_TAG}"
+          else
+            uv run scripts/bump_version.py --check
+          fi
+
+  verify-python:
+    needs: version
+    name: Verify Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install build tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install maturin
+      - name: Create virtual environment
+        run: |
+          python -m venv .venv
+          echo "VENV_PY=.venv/bin/python" >> "${GITHUB_ENV}"
+      - name: Build wheel and run smoke tests
+        run: |
+          "${VENV_PY}" -m pip install --upgrade pip
+          "${VENV_PY}" -m pip install maturin
+          "${VENV_PY}" -m maturin build --release --out dist
+          WHEEL="$(ls dist/*.whl | head -n1)"
+          test -n "${WHEEL}"
+          "${VENV_PY}" -m pip install --force-reinstall "${WHEEL}"
+          "${VENV_PY}" -m ezdwg --version
+          "${VENV_PY}" -m ezdwg inspect examples/data/line_2000.dwg
+          "${VENV_PY}" -m ezdwg inspect test_dwg/line_2007.dwg
+          "${VENV_PY}" -c "import ezdwg; doc = ezdwg.read('test_dwg/line_2007.dwg'); assert doc.version == 'AC1021'; assert doc.decode_version == 'AC1021'; assert sum(1 for _ in doc.modelspace().query('LINE')) == 1; print(doc.decode_version)"
+          "${VENV_PY}" examples/basic_read.py
+
+  verify-crate:
+    name: Verify Rust crate
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Check packaged license
+        run: cmp LICENSE crates/ezdwg-core/LICENSE
+      - name: Run Rust tests
+        run: cargo test -p ezdwg-core --locked
+      - name: Check crates.io package
+        run: cargo publish -p ezdwg-core --dry-run --locked
+      - name: Test examples from the packaged crate
+        run: cargo test --manifest-path target/package/ezdwg-core-*/Cargo.toml --doc --locked
+      - name: Build packaged API documentation
+        run: cargo doc --manifest-path target/package/ezdwg-core-*/Cargo.toml --no-deps --locked
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  build-wheels:
+    name: Build wheels (${{ matrix.os }})
+    needs: verify-python
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python-version: "3.10"
+            manylinux: 2014
+            artifact: linux
+          - os: ubuntu-24.04-arm
+            python-version: "3.10"
+            manylinux: 2014
+            artifact: linux-aarch64
+          - os: windows-latest
+            python-version: "3.10"
+            manylinux: auto
+            artifact: windows
+          - os: macos-latest
+            python-version: "3.10"
+            manylinux: auto
+            archflags: "-arch x86_64 -arch arm64"
+            artifact: macos
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install macOS x86_64 target
+        if: matrix.os == 'macos-latest'
+        run: rustup target add x86_64-apple-darwin
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        env:
+          ARCHFLAGS: ${{ matrix.archflags }}
+        with:
+          command: build
+          args: --release --out dist --compatibility pypi
+          manylinux: ${{ matrix.manylinux }}
+      - name: Smoke test Linux aarch64 wheel
+        # verify-python runs on x86_64 only; check the native aarch64 wheel here.
+        if: matrix.artifact == 'linux-aarch64'
+        run: |
+          python -m venv .venv-smoke
+          .venv-smoke/bin/python -m pip install --upgrade pip
+          .venv-smoke/bin/python -m pip install --only-binary=:all: dist/*.whl
+          .venv-smoke/bin/python -m ezdwg --version
+          .venv-smoke/bin/python -m ezdwg inspect examples/data/line_2000.dwg
+          .venv-smoke/bin/python -m ezdwg inspect test_dwg/line_2007.dwg
+          .venv-smoke/bin/python -c "import platform, ezdwg; assert platform.machine() == 'aarch64'; doc = ezdwg.read('test_dwg/line_2007.dwg'); assert doc.version == 'AC1021'; assert doc.decode_version == 'AC1021'; assert sum(1 for _ in doc.modelspace().query('LINE')) == 1; print(doc.decode_version)"
+          .venv-smoke/bin/python examples/basic_read.py
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: distributions-${{ matrix.artifact }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  build-sdist:
+    name: Build source distribution
+    needs: verify-python
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build source distribution
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+      - name: Upload source distribution artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: distributions-sdist
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: Publish distributions
+    needs: [build-wheels, build-sdist]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download distributions
+        uses: actions/download-artifact@v6
+        with:
+          pattern: distributions-*
+          path: dist
+          merge-multiple: true
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+      - name: Publish to PyPI
+        run: uv publish 'dist/*'
+        env:
+          UV_PUBLISH_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+
+  publish-crate:
+    name: Publish ezdwg-core to crates.io
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [verify-crate, build-wheels, build-sdist]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Publish crate
+        run: cargo publish -p ezdwg-core --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
