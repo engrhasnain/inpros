@@ -28,10 +28,13 @@ Open http://localhost:3100.
 and the FastAPI backend on `/api/*`.
 
 1. Import this GitHub repo in Vercel. Root directory: the repo root (where `vercel.json` is).
-2. Add a Postgres database (Vercel Storage → Neon, or any Postgres) and set the environment variable
-   `DATABASE_URL` (e.g. `postgresql://user:pass@host/db?sslmode=require`).
-   Without it the app still starts, but data lives in `/tmp` and is lost between requests.
-3. Deploy. Open `https://<your-app>.vercel.app` — `/api/health` should show `"database": "postgresql+psycopg"`.
+2. The database is **SQLite**. Locally it is the file `backend/inpros.db`. Vercel keeps no files between
+   requests, so on Vercel use a free **Turso** SQLite database (same as our other projects):
+   create one at turso.tech and set two environment variables in the Vercel project:
+   - `TURSO_DATABASE_URL` = `libsql://<db>-<org>.turso.io`
+   - `TURSO_AUTH_TOKEN` = the database token
+   Without them the app still starts, but data lives in `/tmp` and is lost between requests.
+3. Deploy. Open `https://<your-app>.vercel.app/api/health` — it should show `"database": "sqlite (turso)"`.
 
 Notes:
 - Uploaded drawings and generated files are also stored in the database on Vercel

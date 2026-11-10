@@ -50,15 +50,15 @@ app.include_router(reports.router)
 
 @app.get("/health")
 def health() -> dict:
-    db = settings.database_url.split(":", 1)[0]
+    turso = settings.engine_url.startswith("sqlite+libsql://")
     return {
         "status": "ok",
         "dwg_reader": f"ezdwg {pkg_version('ezdwg')}",
         "dxf_reader": f"ezdxf {pkg_version('ezdxf')}",
-        "database": db,
+        "database": "sqlite (turso)" if turso else "sqlite (local file)",
         "files_in_database": settings.files_in_database,
-        "warning": ("Set DATABASE_URL to a Postgres database: SQLite in /tmp is wiped between Vercel instances."
-                    if ON_VERCEL and db.startswith("sqlite") else None),
+        "warning": ("Set TURSO_DATABASE_URL and TURSO_AUTH_TOKEN: a local SQLite file in /tmp is wiped "
+                    "between Vercel instances." if ON_VERCEL and not turso else None),
     }
 
 
