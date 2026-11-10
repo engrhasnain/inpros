@@ -3,21 +3,28 @@
 Files always live in settings.storage_dir. When settings.files_in_database is on (Vercel),
 every write is also saved in the database and a missing local file is restored from it, so
 any serverless instance can serve any project.
+
+Database copies are zlib-compressed and split into small parts: remote SQLite (Turso)
+limits the size of a single statement, and a drawing plus its preview can be several MB.
 """
 
+import zlib
 from pathlib import Path
 
-from sqlalchemy import LargeBinary, String
+from sqlalchemy import Integer, LargeBinary, String, delete, select
 from sqlalchemy.orm import Mapped, Session, mapped_column
 
 from app.config import settings
 from app.db import Base, SessionLocal
 
+PART_BYTES = 256 * 1024
 
-class StoredFile(Base):
-    __tablename__ = "stored_files"
+
+class StoredFilePart(Base):
+    __tablename__ = "stored_file_parts"
 
     key: Mapped[str] = mapped_column(String(500), primary_key=True)
+    part: Mapped[int] = mapped_column(Integer, primary_key=True)
     data: Mapped[bytes] = mapped_column(LargeBinary)
 
 
@@ -26,6 +33,14 @@ def _key(path: Path) -> str:
         return Path(path).resolve().relative_to(settings.storage_dir.resolve()).as_posix()
     except ValueError:
         return Path(path).as_posix()
+
+
+def _save(db: Session, key: str, data: bytes) -> None:
+    packed = zlib.compress(data, 6)
+    db.execute(delete(StoredFilePart).where(StoredFilePart.key == key))
+    for i in range(0, max(len(packed), 1), PART_BYTES):
+        db.add(StoredFilePart(key=key, part=i // PART_BYTES, data=packed[i:i + PART_BYTES]))
+        db.flush()  # one small INSERT per part
 
 
 def write(path: Path, data: bytes, db: Session | None = None) -> None:
@@ -37,10 +52,10 @@ def write(path: Path, data: bytes, db: Session | None = None) -> None:
     if not settings.files_in_database:
         return
     if db is not None:
-        db.merge(StoredFile(key=_key(path), data=data))
+        _save(db, _key(path), data)
         return
     with SessionLocal() as own:
-        own.merge(StoredFile(key=_key(path), data=data))
+        _save(own, _key(path), data)
         own.commit()
 
 
@@ -56,9 +71,11 @@ def ensure(path: Path) -> bool:
     if not settings.files_in_database:
         return False
     with SessionLocal() as db:
-        row = db.get(StoredFile, _key(path))
-        if row is None:
-            return False
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(row.data)
+        parts = db.scalars(
+            select(StoredFilePart.data).where(StoredFilePart.key == _key(path)).order_by(StoredFilePart.part)
+        ).all()
+    if not parts:
+        return False
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(zlib.decompress(b"".join(parts)))
     return True

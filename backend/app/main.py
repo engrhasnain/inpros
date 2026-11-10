@@ -1,8 +1,13 @@
+import logging
 from contextlib import asynccontextmanager
 from importlib.metadata import version as pkg_version
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from sqlalchemy import text
+
+logger = logging.getLogger("inpros")
 
 from app import files, models  # noqa: F401  (registers tables)
 from app.api import catalog, drawings, estimaciones, projects, reports
@@ -14,7 +19,10 @@ from app.migrate import migrate
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     settings.storage_dir.mkdir(parents=True, exist_ok=True)
-    migrate(engine)  # additive only; replace with Alembic migrations before production
+    try:
+        migrate(engine)  # additive only; replace with Alembic migrations before production
+    except Exception:  # keep serving so /health can show the database problem
+        logger.exception("Database setup failed")
     yield
 
 
@@ -48,11 +56,25 @@ app.include_router(estimaciones.router)
 app.include_router(reports.router)
 
 
+@app.exception_handler(Exception)
+async def unexpected_error(request: Request, exc: Exception) -> JSONResponse:
+    """Show the real cause instead of a bare 'Internal Server Error' (Vercel hides server logs)."""
+    logger.exception("Unhandled error on %s %s", request.method, request.url.path)
+    return JSONResponse(status_code=500, content={"detail": f"Server error: {type(exc).__name__}: {str(exc)[:500]}"})
+
+
 @app.get("/health")
 def health() -> dict:
     turso = settings.engine_url.startswith("sqlite+libsql://")
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("select 1"))
+        db_status = "ok"
+    except Exception as exc:  # report, don't crash: this endpoint is for diagnosis
+        db_status = f"error: {type(exc).__name__}: {str(exc)[:300]}"
     return {
-        "status": "ok",
+        "status": "ok" if db_status == "ok" else "degraded",
+        "database_connection": db_status,
         "dwg_reader": f"ezdwg {pkg_version('ezdwg')}",
         "dxf_reader": f"ezdxf {pkg_version('ezdxf')}",
         "database": "sqlite (turso)" if turso else "sqlite (local file)",
