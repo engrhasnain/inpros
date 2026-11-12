@@ -318,6 +318,8 @@ export const api = {
   exportUrl: (id: number) => `${API_URL}/estimaciones/${id}/export.xlsx`,
 
   updateProject: (projectId: number, data: ProjectDetails) => request<Project>(`/projects/${projectId}`, json("PUT", data)),
+  deleteProject: (projectId: number) => request<void>(`/projects/${projectId}`, json("DELETE")),
+  deleteDrawing: (drawingId: number) => request<void>(`/drawings/${drawingId}`, json("DELETE")),
   readiness: (projectId: number) => request<Readiness>(`/projects/${projectId}/report-readiness`),
   dictamenUrl: (estId: number) => `${API_URL}/estimaciones/${estId}/dictamen.pdf`,
 

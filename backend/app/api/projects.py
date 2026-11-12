@@ -1,9 +1,10 @@
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
+from app import files
 from app.db import get_db
-from app.models import Project
+from app.models import Bid, CatalogItem, Estimacion, FieldEntry, ItemMapping, Project
 from app.schemas import ProjectCreate, ProjectOut, ProjectUpdate
 from app.services.report_data import report_readiness
 
@@ -44,6 +45,24 @@ def update_project(project_id: int, body: ProjectUpdate, db: Session = Depends(g
         setattr(project, k, v.strip() if isinstance(v, str) else v)
     db.commit()
     return project
+
+
+@router.delete("/{project_id}", status_code=204)
+def delete_project(project_id: int, db: Session = Depends(get_db)) -> None:
+    """Delete a project and everything in it: drawings and their files, catalog, links,
+    estimaciones, bids and site progress."""
+    project = _get(db, project_id)
+    items = list(db.scalars(select(CatalogItem).where(CatalogItem.project_id == project_id)))
+    if items:
+        db.execute(delete(ItemMapping).where(ItemMapping.catalog_item_id.in_([c.id for c in items])))
+    for model in (Estimacion, Bid):  # ORM delete so their lines cascade
+        for row in db.scalars(select(model).where(model.project_id == project_id)):
+            db.delete(row)
+    db.execute(delete(CatalogItem).where(CatalogItem.project_id == project_id))
+    db.execute(delete(FieldEntry).where(FieldEntry.project_id == project_id))
+    files.delete_prefix(db, f"project_{project_id}/")
+    db.delete(project)  # drawings and versions cascade
+    db.commit()
 
 
 @router.get("/{project_id}/report-readiness")

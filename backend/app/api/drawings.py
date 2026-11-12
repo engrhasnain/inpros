@@ -159,6 +159,17 @@ def get_project_takeoff(project_id: int, db: Session = Depends(get_db)) -> list[
     return project_takeoff(db, project_id)
 
 
+@router.delete("/drawings/{drawing_id}", status_code=204)
+def delete_drawing(drawing_id: int, db: Session = Depends(get_db)) -> None:
+    """Delete a drawing with all its versions and files. Catalog links to it show 'Linked item gone'."""
+    drawing = db.get(Drawing, drawing_id)
+    if not drawing:
+        raise HTTPException(404, "Drawing not found")
+    files.delete_prefix(db, f"project_{drawing.project_id}/drawing_{drawing.id}/")
+    db.delete(drawing)
+    db.commit()
+
+
 @router.get("/projects/{project_id}/takeoff-summary")
 def get_takeoff_summary(project_id: int, db: Session = Depends(get_db)) -> list[dict]:
     """Per drawing (latest version): sheets, exclusions, zones and items."""

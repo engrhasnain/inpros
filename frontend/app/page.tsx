@@ -107,6 +107,34 @@ export default function Home() {
     setBusy(false);
   }
 
+  async function removeProject(p: Project) {
+    if (!window.confirm(`Delete the project "${p.name}" and everything in it (drawings, catalog, estimaciones, bids, site progress)?\n\nThis cannot be undone.`)) return;
+    try {
+      await api.deleteProject(p.id);
+      const rest = projects.filter((x) => x.id !== p.id);
+      setProjects(rest);
+      if (rest.length) selectProject(rest[0]);
+      else {
+        setProject(null);
+        setDrawings([]);
+        setUploads([]);
+      }
+    } catch (e) {
+      window.alert((e as Error).message);
+    }
+  }
+
+  async function removeDrawing(d: Drawing) {
+    if (!project) return;
+    if (!window.confirm(`Delete the drawing "${d.name}" with all its versions?\n\nThis cannot be undone.`)) return;
+    try {
+      await api.deleteDrawing(d.id);
+      await refreshDrawings(project);
+    } catch (e) {
+      window.alert((e as Error).message);
+    }
+  }
+
   return (
     <main className="mx-auto w-full max-w-5xl px-4 py-8 sm:px-6">
       <header className="mb-8 flex flex-wrap items-center justify-between gap-3">
@@ -127,6 +155,7 @@ export default function Home() {
               setProjects((prev) => [p, ...prev]);
               selectProject(p);
             }}
+            onDelete={removeProject}
             disabled={backendOk === false && projects.length === 0 && backendMsg.startsWith("Cannot")}
           />
         </Step>
@@ -158,7 +187,7 @@ export default function Home() {
           {drawings.length === 0 ? (
             <p className="text-sm text-slate-500">No drawings yet.</p>
           ) : (
-            <DrawingsTable drawings={drawings} />
+            <DrawingsTable drawings={drawings} onDelete={removeDrawing} />
           )}
         </Step>
 
@@ -220,12 +249,14 @@ function ProjectPicker({
   current,
   onSelect,
   onCreated,
+  onDelete,
   disabled,
 }: {
   projects: Project[];
   current: Project | null;
   onSelect: (p: Project) => void;
   onCreated: (p: Project) => void;
+  onDelete: (p: Project) => void;
   disabled: boolean;
 }) {
   const [creating, setCreating] = useState(false);
@@ -302,6 +333,15 @@ function ProjectPicker({
       >
         + New project
       </button>
+      {current && (
+        <button
+          className="rounded-lg border border-red-200 px-4 py-2 text-sm font-medium text-red-700 hover:bg-red-50"
+          onClick={() => onDelete(current)}
+          disabled={disabled}
+        >
+          Delete project
+        </button>
+      )}
     </div>
   );
 }
@@ -352,7 +392,7 @@ function UploadIcon({ state }: { state: UploadRow["state"] }) {
   return <span className={`w-4 text-center font-bold ${color}`}>{icon}</span>;
 }
 
-function DrawingsTable({ drawings }: { drawings: Drawing[] }) {
+function DrawingsTable({ drawings, onDelete }: { drawings: Drawing[]; onDelete: (d: Drawing) => void }) {
   return (
     <div>
       <div className="overflow-x-auto">
@@ -410,14 +450,23 @@ function DrawingsTable({ drawings }: { drawings: Drawing[] }) {
                   <td className="py-2.5 pr-4 text-right tabular-nums">{v.label_count?.toLocaleString() ?? "—"}</td>
                   <td className="py-2.5 pr-4 whitespace-nowrap text-slate-500">{new Date(v.uploaded_at).toLocaleString()}</td>
                   <td className="py-2.5 text-right">
-                    {ready && (
-                      <Link
-                        href={`/drawings/${v.id}`}
-                        className="whitespace-nowrap rounded-lg border border-slate-300 px-3 py-1 text-xs font-medium hover:bg-white"
+                    <div className="flex items-center justify-end gap-2">
+                      {ready && (
+                        <Link
+                          href={`/drawings/${v.id}`}
+                          className="whitespace-nowrap rounded-lg border border-slate-300 px-3 py-1 text-xs font-medium hover:bg-white"
+                        >
+                          Open →
+                        </Link>
+                      )}
+                      <button
+                        onClick={() => onDelete(d)}
+                        title="Delete this drawing and all its versions"
+                        className="rounded-lg px-2 py-1 text-xs text-slate-400 hover:bg-red-50 hover:text-red-700"
                       >
-                        Open →
-                      </Link>
-                    )}
+                        Delete
+                      </button>
+                    </div>
                   </td>
                 </tr>
               );
